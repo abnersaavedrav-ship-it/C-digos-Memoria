@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codispersion-real-case"
+version = "0.1.0"
+description = "Aplicación real de codispersión y bootstrap espacial pareado para imágenes de nanotubos."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "pillow",
+    "imageio",
+    "seaborn",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

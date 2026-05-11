@@ -1,0 +1,597 @@
+QUINTO ESTUDIO DE SIMULACIÓN
+______________________________________________________________________________________________________________
+
+import numpy as np
+from typing import Tuple, List, Dict
+from dataclasses import dataclass
+
+# ============================================================
+# BLOQUE 0 — Utilidades base (robustas para NumPy >= 2.0)
+# ============================================================
+def _asarray_f64(a) -> np.ndarray:
+    return np.asarray(a, dtype=np.float64)
+
+def _nanmean(a: np.ndarray) -> float:
+    a = _asarray_f64(a)
+    m = np.isfinite(a)
+    return float(a[m].mean()) if m.any() else np.nan
+
+def _nanvar(a: np.ndarray, ddof: int = 0) -> float:
+    a = _asarray_f64(a)
+    m = np.isfinite(a)
+    n = int(m.sum())
+    if n == 0 or n - ddof <= 0:
+        return np.nan
+    mu = float(a[m].mean())
+    return float(((a[m] - mu)**2).sum() / (n - ddof))
+
+def _nanstd(a: np.ndarray, ddof: int = 0) -> float:
+    v = _nanvar(a, ddof=ddof)
+    return float(np.sqrt(v)) if np.isfinite(v) else np.nan
+
+def tukey_window_2d(n1: int, n2: int, alpha: float = 0.5) -> np.ndarray:
+    def tukey_1d(n, a):
+        n = int(n)
+        if a <= 0:  return np.ones(n, dtype=np.float64)
+        if a >= 1:  return np.hanning(n).astype(np.float64)
+        w = np.ones(n, dtype=np.float64)
+        edge = int(a*(n-1)/2.0)
+        if edge > 0:
+            x = np.linspace(0, np.pi, edge, endpoint=False)
+            w[:edge] = 0.5*(1 - np.cos(x))
+            w[-edge:] = 0.5*(1 - np.cos(x[::-1]))
+        return w
+    return np.outer(tukey_1d(n1, alpha), tukey_1d(n2, alpha))
+
+def zscore_pairwise(X: np.ndarray, Y: np.ndarray, eps: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
+    X = _asarray_f64(X); Y = _asarray_f64(Y)
+    Xc = X - _nanmean(X);  Yc = Y - _nanmean(Y)
+    Xs = Xc / (max(_nanstd(Xc), 0.0) + eps)
+    Ys = Yc / (max(_nanstd(Yc), 0.0) + eps)
+    return Xs, Ys
+
+# ============================================================
+# BLOQUE 1 — Matérn 2D espectral con anisotropía + LMC bivariante
+# ============================================================
+@dataclass
+class MaternParams:
+    nu: float           # suavidad (ν)
+    ell: float          # rango/escala (ℓ)
+    sill: float         # varianza marginal deseada (se normaliza empíricamente)
+    anis_ratio: float   # >=1, razón de anisotropía (eje mayor / menor)
+    angle_deg: float    # rotación (grados) del eje mayor
+
+def _freq_grids(n1: int, n2: int) -> Tuple[np.ndarray, np.ndarray]:
+    k1 = np.fft.fftfreq(n1) * (2*np.pi)  # frecuencias angulares
+    k2 = np.fft.fftfreq(n2) * (2*np.pi)
+    K1, K2 = np.meshgrid(k2, k1)         # ojo: orden (fila, columna) -> (y,x)
+    return K1, K2
+
+def _anisotropic_quadform(K1: np.ndarray, K2: np.ndarray, anis_ratio: float, angle_deg: float) -> np.ndarray:
+    # Transformación anisotrópica en el espacio de frecuencias:
+    # rotación por theta y escalamiento por (a, 1/a)
+    a = float(max(anis_ratio, 1.0))
+    theta = np.deg2rad(angle_deg)
+    c, s = np.cos(theta), np.sin(theta)
+    # Rotar (Kx,Ky) -> (u,v)
+    u = c*K1 + s*K2
+    v = -s*K1 + c*K2
+    # Escalar: eje mayor comprimido por a en frecuencia (equivalente a estirar en espacio)
+    u_scaled = u / a
+    v_scaled = v * a
+    return u_scaled**2 + v_scaled**2
+
+def _matern_spectral_density(K1: np.ndarray, K2: np.ndarray, nu: float, ell: float,
+                             anis_ratio: float, angle_deg: float) -> np.ndarray:
+    # S(ω) ∝ (κ^2 + |ω|_aniso^2)^(-(ν + d/2)), d=2
+    kappa2 = (2.0*nu) / (ell**2)
+    quad = _anisotropic_quadform(K1, K2, anis_ratio, angle_deg)
+    expo = -(nu + 1.0)  # d/2=1
+    S = (kappa2 + quad) ** expo
+    S[0,0] = S[0,0]  # mantener DC
+    return S
+
+def simulate_matern_fft(n1: int, n2: int, params: MaternParams, rng: np.random.Generator) -> np.ndarray:
+    K1, K2 = _freq_grids(n1, n2)
+    S = _matern_spectral_density(K1, K2, params.nu, params.ell, params.anis_ratio, params.angle_deg)
+    S = np.maximum(S, 0.0)
+    # Excitación compleja con simetría Hermítica implícita en ifft2(real-output)
+    Z_real = rng.normal(size=(n1, n2))
+    Z_imag = rng.normal(size=(n1, n2))
+    W = Z_real + 1j*Z_imag
+    F = np.sqrt(S) * W
+    # Campo espacial (real)
+    X = np.fft.ifft2(F).real
+    # Normaliza a sill deseado (escala empírica)
+    X = X / (np.std(X) + 1e-12) * np.sqrt(params.sill)
+    return X
+
+def lmc_pair_matern(
+    n1: int, n2: int,
+    p1: MaternParams, p2: MaternParams,
+    rho0: float,
+    rng: np.random.Generator
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    LMC simple: X = Z1
+                Y = rho0 * Z1 + sqrt(1-rho0^2) * Z2
+    con Z1 ~ Matérn(p1), Z2 ~ Matérn(p2) independientes, ambos con sill=1 por normalización.
+    Luego reescala para sill_X, sill_Y si se desea (aquí sill los fija p1.sill y p2.sill).
+    """
+    Z1 = simulate_matern_fft(n1, n2, MaternParams(p1.nu, p1.ell, 1.0, p1.anis_ratio, p1.angle_deg), rng)
+    Z2 = simulate_matern_fft(n1, n2, MaternParams(p2.nu, p2.ell, 1.0, p2.anis_ratio, p2.angle_deg), rng)
+    Z1 = Z1 / (np.std(Z1) + 1e-12)
+    Z2 = Z2 / (np.std(Z2) + 1e-12)
+    X = Z1
+    Y = rho0 * Z1 + np.sqrt(max(1.0 - rho0**2, 0.0)) * Z2
+    # Ajusta varianzas marginales a sill de entrada
+    X = X * np.sqrt(p1.sill)
+    Y = Y * np.sqrt(p2.sill)
+    return X, Y
+
+# ============================================================
+# BLOQUE 2 — Codispersión como promedio de aportes locales
+# ============================================================
+def codisp_rho_hat(X: np.ndarray, Y: np.ndarray, h: Tuple[int,int], mode: str = "toroidal") -> float:
+    X = _asarray_f64(X); Y = _asarray_f64(Y)
+    n1, n2 = X.shape
+    h1, h2 = h
+    if mode == "toroidal":
+        I = (np.arange(n1)[:, None] + h1) % n1
+        J = (np.arange(n2)[None, :] + h2) % n2
+        dX = X[I, J] - X
+        dY = Y[I, J] - Y
+    else:
+        I = np.arange(0, n1 - abs(h1)) if h1 >= 0 else np.arange(abs(h1), n1)
+        J = np.arange(0, n2 - abs(h2)) if h2 >= 0 else np.arange(abs(h2), n2)
+        if I.size == 0 or J.size == 0: return 0.0
+        X0 = X[np.ix_(I, J)]; Y0 = Y[np.ix_(I, J)]
+        I2 = I + (h1 if h1 >= 0 else -abs(h1))
+        J2 = J + (h2 if h2 >= 0 else -abs(h2))
+        dX = X[np.ix_(I2, J2)] - X0
+        dY = Y[np.ix_(I2, J2)] - Y0
+    Abar = float((dX**2).mean()); Bbar = float((dY**2).mean())
+    denom = np.sqrt(max(Abar, 0.0) * max(Bbar, 0.0))
+    if denom == 0.0: return 0.0
+    S = (dX * dY) / denom
+    return float(S.mean())
+
+# ============================================================
+# BLOQUE 3 — Remuestreos: BB (Lahiri, 2003) y CBB pareado toroidal
+# ============================================================
+def _list_overlapping_origins(n1: int, n2: int, b: int) -> List[Tuple[int,int]]:
+    I = range(0, n1 - b + 1); J = range(0, n2 - b + 1)
+    return [(i, j) for i in I for j in J]
+
+def bb_lahiri_sample_pair(X: np.ndarray, Y: np.ndarray, b: int, rng: np.random.Generator) -> Tuple[np.ndarray,np.ndarray]:
+    X = _asarray_f64(X); Y = _asarray_f64(Y)
+    n1, n2 = X.shape
+    M1 = (n1 // b) * b; M2 = (n2 // b) * b
+    nB1 = M1 // b; nB2 = M2 // b
+    Xs = np.zeros((M1, M2), dtype=np.float64)
+    Ys = np.zeros((M1, M2), dtype=np.float64)
+    origins = _list_overlapping_origins(n1, n2, b)
+    n_orig = len(origins)
+    for bi in range(nB1):
+        for bj in range(nB2):
+            oi, oj = origins[rng.integers(0, n_orig)]
+            Xs[bi*b:(bi+1)*b, bj*b:(bj+1)*b] = X[oi:oi+b, oj:oj+b]
+            Ys[bi*b:(bi+1)*b, bj*b:(bj+1)*b] = Y[oi:oi+b, oj:oj+b]
+    return Xs, Ys
+
+def cbb_sample_pair(X: np.ndarray, Y: np.ndarray, b: int, rng: np.random.Generator) -> Tuple[np.ndarray,np.ndarray]:
+    """
+    CBB toroidal pareado: elige posiciones de inicio uniformes en torus y mosaica con wrap.
+    """
+    X = _asarray_f64(X); Y = _asarray_f64(Y)
+    n1, n2 = X.shape
+    nB1 = int(np.ceil(n1 / b)); nB2 = int(np.ceil(n2 / b))
+    Xs = np.zeros((nB1*b, nB2*b), dtype=np.float64)
+    Ys = np.zeros_like(Xs)
+    for bi in range(nB1):
+        for bj in range(nB2):
+            oi = rng.integers(0, n1)  # esquina aleatoria en torus
+            oj = rng.integers(0, n2)
+            # extraer bloque b×b con wrap
+            I = (oi + np.arange(b)) % n1
+            J = (oj + np.arange(b)) % n2
+            Xs[bi*b:(bi+1)*b, bj*b:(bj+1)*b] = X[np.ix_(I, J)]
+            Ys[bi*b:(bi+1)*b, bj*b:(bj+1)*b] = Y[np.ix_(I, J)]
+    # recorta a tamaño original
+    return Xs[:n1, :n2], Ys[:n1, :n2]
+
+def bootstrap_codisp(
+    X: np.ndarray, Y: np.ndarray, H: List[Tuple[int,int]],
+    b: int, B: int, rng: np.random.Generator,
+    sampler: str = "BB", mode_rho: str = "toroidal"
+) -> Dict[Tuple[int,int], Dict[str, np.ndarray]]:
+    """
+    Devuelve por h: {'samples': rho_star (B,), 'var': Var*, 'ci': (lo,hi)}
+    sampler: 'BB' (Lahiri) o 'CBB' (toroidal pareado)
+    """
+    rho_star = {h: np.empty(B, dtype=np.float64) for h in H}
+    for k in range(B):
+        if sampler == "BB":
+            Xs, Ys = bb_lahiri_sample_pair(X, Y, b, rng)
+        elif sampler == "CBB":
+            Xs, Ys = cbb_sample_pair(X, Y, b, rng)
+        else:
+            raise ValueError("sampler must be 'BB' or 'CBB'")
+        for h in H:
+            rho_star[h][k] = codisp_rho_hat(Xs, Ys, h, mode=mode_rho)
+    out = {}
+    for h in H:
+        v = float(np.var(rho_star[h], ddof=1))
+        lo = float(np.percentile(rho_star[h], 2.5))
+        hi = float(np.percentile(rho_star[h], 97.5))
+        out[h] = {"samples": rho_star[h], "var": v, "ci": (lo, hi)}
+    return out
+
+# ============================================================
+# BLOQUE 4 — Loop Monte Carlo + métricas (Var_MC, Var*, Cobertura, etc.)
+# ============================================================
+@dataclass
+class Scenario:
+    rho0: float
+    range_pix: float
+    anis_mode: str      # 'iso' o 'aniso'
+    anis_ratio: float
+    angle_deg: float
+    nu: float
+    n1: int
+    n2: int
+    B_boot: int
+    b_block: int
+    R_mc: int
+
+def run_mc_study_lmc(
+    sc: Scenario,
+    H: List[Tuple[int,int]],
+    use_taper: bool = True,
+    tukey_alpha: float = 0.5,
+    seed: int = 12345
+) -> Dict[str, Dict]:
+    """
+    Para cada réplica r=1..R:
+      1) Simula (X,Y) ~ LMC(Matérn) con anisotropía (si corresponde)
+      2) (Opcional) aplica taper Tukey y z-score pareado
+      3) Calcula rho_hat(h)
+      4) Ejecuta BB (Lahiri) y CBB, calcula Var*, IC y guarda
+    Al final:
+      - Var_MC(h) (varianza entre réplicas de rho_hat(h))
+      - Promedio Var*_{BB}(h) y Var*_{CBB}(h)
+      - Cobertura (IC contiene la media MC de rho_hat(h))
+      - Ratios Var*/Var_MC
+    """
+    rng = np.random.default_rng(seed)
+    # Parámetros Matérn para los dos componentes de LMC
+    # Mismo nu y rango (simple), puedes diferenciar si deseas
+    p1 = MaternParams(nu=sc.nu, ell=sc.range_pix, sill=1.0,
+                      anis_ratio=(sc.anis_ratio if sc.anis_mode=='aniso' else 1.0),
+                      angle_deg=(sc.angle_deg if sc.anis_mode=='aniso' else 0.0))
+    p2 = MaternParams(nu=sc.nu, ell=sc.range_pix, sill=1.0,
+                      anis_ratio=(sc.anis_ratio if sc.anis_mode=='aniso' else 1.0),
+                      angle_deg=(sc.angle_deg if sc.anis_mode=='aniso' else 0.0))
+
+    R = sc.R_mc; B = sc.B_boot; b = sc.b_block
+    n1, n2 = sc.n1, sc.n2
+
+    # Buffers
+    rho_hat = {h: np.empty(R, dtype=np.float64) for h in H}
+    var_star_BB = {h: np.empty(R, dtype=np.float64) for h in H}
+    var_star_CBB = {h: np.empty(R, dtype=np.float64) for h in H}
+    cover_BB = {h: np.empty(R, dtype=bool) for h in H}
+    cover_CBB = {h: np.empty(R, dtype=bool) for h in H}
+
+    # Réplicas MC
+    for r in range(R):
+        X, Y = lmc_pair_matern(n1, n2, p1, p2, sc.rho0, rng)
+        # Preprocesamiento común: z-score + taper
+        X, Y = zscore_pairwise(X, Y)
+        if use_taper:
+            W = tukey_window_2d(n1, n2, alpha=tukey_alpha)
+            X *= W; Y *= W
+
+        # rho_hat original
+        for h in H:
+            rho_hat[h][r] = codisp_rho_hat(X, Y, h, mode="toroidal")
+
+        # Bootstraps
+        out_BB  = bootstrap_codisp(X, Y, H, b=b, B=B, rng=rng, sampler="BB",  mode_rho="toroidal")
+        out_CBB = bootstrap_codisp(X, Y, H, b=b, B=B, rng=rng, sampler="CBB", mode_rho="toroidal")
+
+        # Guarda var* y cobertura plug-in (respecto a media MC provisoria; la afinamos luego)
+        # temporalmente contra rho_hat[h][r] (se ajusta luego con media MC final)
+        for h in H:
+            var_star_BB[h][r]  = out_BB[h]["var"]
+            var_star_CBB[h][r] = out_CBB[h]["var"]
+
+    # Media MC por h (plug-in) para cobertura
+    rho_mean_MC = {h: float(rho_hat[h].mean()) for h in H}
+    # Recalcular cobertura usando los IC que ya se generaron en cada réplica — necesitamos repetir el bootstrap o
+    # guardarlos; para no re-bootstrapping, re-ejecutamos una pasada rápida para IC y cobertura:
+    rng2 = np.random.default_rng(seed + 987)
+    for r in range(R):
+        # repetir sólo para IC (rápido si B no es enorme)
+        # re-simular exactamente la misma réplica no es necesario para cobertura plug-in
+        X, Y = lmc_pair_matern(n1, n2, p1, p2, sc.rho0, rng2)
+        X, Y = zscore_pairwise(X, Y)
+        if use_taper:
+            W = tukey_window_2d(n1, n2, alpha=tukey_alpha)
+            X *= W; Y *= W
+        out_BB  = bootstrap_codisp(X, Y, H, b=b, B=B, rng=rng2, sampler="BB",  mode_rho="toroidal")
+        out_CBB = bootstrap_codisp(X, Y, H, b=b, B=B, rng=rng2, sampler="CBB", mode_rho="toroidal")
+        for h in H:
+            lo_BB, hi_BB = out_BB[h]["ci"]
+            lo_CB, hi_CB = out_CBB[h]["ci"]
+            mu = rho_mean_MC[h]
+            cover_BB[h][r]  = (lo_BB <= mu) and (mu <= hi_BB)
+            cover_CBB[h][r] = (lo_CB <= mu) and (mu <= hi_CB)
+
+    # Agregados finales
+    results = {}
+    for h in H:
+        var_mc = float(np.var(rho_hat[h], ddof=1))
+        vbb = float(var_star_BB[h].mean())
+        vcb = float(var_star_CBB[h].mean())
+        covBB = float(np.mean(cover_BB[h]))
+        covCB = float(np.mean(cover_CBB[h]))
+        results[h] = {
+            "rho_hat_mean": rho_mean_MC[h],
+            "Var_MC": var_mc,
+            "Var*_BB_mean": vbb,
+            "Var*_CBB_mean": vcb,
+            "ratio_BB": (vbb / var_mc) if var_mc > 0 else np.nan,
+            "ratio_CBB": (vcb / var_mc) if var_mc > 0 else np.nan,
+            "coverage_BB": covBB,
+            "coverage_CBB": covCB,
+        }
+    return results
+
+# ============================================================
+# ESCENARIO BASE PROFESIONAL (para usar con el script anterior)
+# ============================================================
+# Requisitos: tener cargadas las definiciones de:
+#  - Scenario (dataclass)
+#  - run_mc_study_lmc (función de estudio Monte Carlo)
+#  - y dependencias ya provistas en el script previo
+
+# 1) Parámetros del escenario base profesional
+n1 = n2 = 256
+nu = 1.0
+range_pix = 3.5         # es 7 el rango efectivo pero r_eff ~ 2l y range_pix=l por error
+rho0 = 0.5
+anis_mode = "aniso"     # 'iso' o 'aniso'
+anis_ratio = 2.0
+angle_deg = 45.0
+B_boot = 800            # réplicas bootstrap
+R_mc = 100              # réplicas Monte Carlo
+b_list = [16, 32, 48]   # tamaños de bloque
+
+# 2) Conjunto de lags (base direccional corta + múltiplos)
+H = [(1,0), (0,1), (1,1), (-1,1), (2,0), (0,2), (2,2), (-2,2)]
+
+# 3) Función auxiliar para imprimir tabla bonita y resumen agregado
+def print_results_table(res_dict, H, b_value):
+    header = f"[BB vs CBB] Escenario base profesional | b = {b_value}"
+    print("\n" + header)
+    print("-" * len(header))
+    subh = "h         | rho_mean   Var_MC      Var*_BB   Var*_CBB   ratio_BB  ratio_CBB  cov_BB  cov_CBB"
+    print(subh)
+    print("-"*len(subh))
+    ratios_bb, ratios_cbb, cov_bb, cov_cbb = [], [], [], []
+    rho_abs = []
+
+    for h in H:
+        r = res_dict[h]
+        h_str = f"{h}"
+        print(f"{h_str:<9} | {r['rho_hat_mean']:>+8.4f}  {r['Var_MC']:>8.2e}  "
+              f"{r['Var*_BB_mean']:>8.2e}  {r['Var*_CBB_mean']:>9.2e}  "
+              f"{r['ratio_BB']:>8.3f}  {r['ratio_CBB']:>9.3f}  "
+              f"{r['coverage_BB']:>6.2f}  {r['coverage_CBB']:>7.2f}")
+        if np.isfinite(r['ratio_BB']):  ratios_bb.append(r['ratio_BB'])
+        if np.isfinite(r['ratio_CBB']): ratios_cbb.append(r['ratio_CBB'])
+        cov_bb.append(r['coverage_BB']); cov_cbb.append(r['coverage_CBB'])
+        rho_abs.append((h, abs(r['rho_hat_mean'])))
+
+    # Resumen agregado
+    mean_ratio_bb  = float(np.mean(ratios_bb))  if ratios_bb  else np.nan
+    mean_ratio_cbb = float(np.mean(ratios_cbb)) if ratios_cbb else np.nan
+    mean_cov_bb    = float(np.mean(cov_bb))     if cov_bb     else np.nan
+    mean_cov_cbb   = float(np.mean(cov_cbb))    if cov_cbb    else np.nan
+    h_star, rho_star = max(rho_abs, key=lambda t: t[1])
+
+    print("\nResumen agregado (promedio sobre lags H):")
+    print(f"  • ratio_BB medio   = {mean_ratio_bb:>6.3f}   (≈1 ideal)")
+    print(f"  • ratio_CBB medio  = {mean_ratio_cbb:>6.3f}   (≈1 ideal)")
+    print(f"  • cobertura_BB     = {mean_cov_bb:>6.3f}   (≈0.95 ideal)")
+    print(f"  • cobertura_CBB    = {mean_cov_cbb:>6.3f}   (≈0.95 ideal)")
+    print(f"  • h* (máx |rho|)   = {h_star}, |rho_mean| = {rho_star:.4f}")
+
+# 4) Loop de tamaños de bloque y ejecución
+all_results = {}
+seed_base = 2025  # fija semilla para reproducibilidad
+
+for idx, b in enumerate(b_list):
+    scenario = Scenario(
+        rho0=rho0,
+        range_pix=range_pix,
+        anis_mode=anis_mode,
+        anis_ratio=anis_ratio,
+        angle_deg=angle_deg,
+        nu=nu,
+        n1=n1, n2=n2,
+        B_boot=B_boot,
+        b_block=b,
+        R_mc=R_mc
+    )
+    # Nota: usa taper Tukey y modo toroidal internamente (por defecto del estudio)
+    results = run_mc_study_lmc(scenario, H, use_taper=True, tukey_alpha=0.5, seed=seed_base + idx)
+    all_results[b] = results
+    print_results_table(results, H, b)
+
+# 5) (Opcional) Selección automática de b por mejor calibración (ratio_CBB más cercano a 1)
+best_b = None
+best_score = np.inf
+for b in b_list:
+    res = all_results[b]
+    ratios_cbb = [res[h]["ratio_CBB"] for h in H if np.isfinite(res[h]["ratio_CBB"])]
+    if len(ratios_cbb) == 0:
+        continue
+    score = abs(np.mean(ratios_cbb) - 1.0)
+    if score < best_score:
+        best_score = score
+        best_b = b
+
+print("\nSelección de b (heurística por calibración CBB):")
+print(f"  • b óptimo (ratio_CBB medio más cercano a 1) = {best_b} (score={best_score:.3f})")
+
+print("\nNotas:")
+print("- Este escenario corresponde al diseño profesional propuesto: Matérn LMC bivariante, ν=1, ℓ=3.5 px, ρ0=0.5, anisotropía 2:1 a 45°,")
+print("  grilla 256×256, B=800, R=100, H direccional corta+múltiplos, preproc z-score + Tukey, comparación BB (Lahiri) vs CBB pareado toroidal.")
+print("- Usa b en {16,32,48} (~0.5 r_eff, r_eff, 1.5 r_eff). La línea final sugiere el b con mejor calibración (ratio_CBB medio ≈ 1).")
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# GRAFICOS TIPO PAPER – Bootstrap espacial (BB vs CBB)
+# ============================================================
+# Requisitos:
+#  - Diccionario all_results[b] generado previamente (run_mc_study_lmc)
+#  - Lista de lags H = [(1,0), (0,1), …]
+#  - b_list = [16, 32, 48]
+#  - best_b obtenido del bloque anterior
+
+# 1) Prepara estructura de datos
+def norm_h(h):
+    return np.sqrt(h[0]**2 + h[1]**2)
+
+H_sorted = sorted(H, key=lambda h: norm_h(h))
+lags_norm = [norm_h(h) for h in H_sorted]
+unique_norms = sorted(list(set(lags_norm)))
+
+# 2) Colores y estilo
+colors = {16: "#6aa84f", 32: "#1155cc", 48: "#cc0000"}  # verde, azul, rojo
+plt.rcParams.update({
+    "font.size": 12,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.titlesize": 13,
+    "axes.labelsize": 12
+})
+
+# 3) FIGURA 1 — Ratio Var*/Var_MC vs ||h||
+plt.figure(figsize=(8, 5))
+for b in b_list:
+    res = all_results[b]
+    ratios_bb = [res[h]["ratio_BB"] for h in H_sorted]
+    ratios_cbb = [res[h]["ratio_CBB"] for h in H_sorted]
+    plt.plot(lags_norm, ratios_bb, marker="o", linestyle="--", color=colors[b], alpha=0.55,
+             label=f"BB b={b}")
+    plt.plot(lags_norm, ratios_cbb, marker="s", linestyle="-", color=colors[b],
+             label=f"CBB b={b}")
+
+plt.axhline(1, color="black", linewidth=1, linestyle=":")
+plt.title("Calibración de varianza bootstrap por lag (Var*/Var_MC)")
+plt.xlabel(r"Distancia del lag $\|h\|$")
+plt.ylabel(r"Ratio Var*/Var$_{MC}$")
+plt.legend(frameon=False, ncol=2)
+plt.text(2.2, 1.03, f"b óptimo ≈ {best_b}", fontsize=11, color="black")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 4) FIGURA 2 — Cobertura vs ||h||
+plt.figure(figsize=(8, 5))
+for b in b_list:
+    res = all_results[b]
+    cov_bb = [res[h]["coverage_BB"] for h in H_sorted]
+    cov_cbb = [res[h]["coverage_CBB"] for h in H_sorted]
+    plt.plot(lags_norm, cov_bb, marker="o", linestyle="--", color=colors[b], alpha=0.55,
+             label=f"BB b={b}")
+    plt.plot(lags_norm, cov_cbb, marker="s", linestyle="-", color=colors[b],
+             label=f"CBB b={b}")
+
+plt.axhline(0.95, color="black", linewidth=1, linestyle=":")
+plt.title("Cobertura empírica 95% por lag")
+plt.xlabel(r"Distancia del lag $\|h\|$")
+plt.ylabel("Cobertura (proporción)")
+plt.legend(frameon=False, ncol=2)
+plt.text(2.2, 0.955, f"b óptimo ≈ {best_b}", fontsize=11, color="black")
+plt.ylim(0.75, 1.0)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+
+______________________________________________________________________________________________________________________________________________________
+
+[BB vs CBB] Escenario base profesional | b = 16
+-----------------------------------------------
+h         | rho_mean   Var_MC      Var*_BB   Var*_CBB   ratio_BB  ratio_CBB  cov_BB  cov_CBB
+--------------------------------------------------------------------------------------------
+(1, 0)    |  +0.5000  1.38e-04  8.92e-05   9.78e-05     0.647      0.709    0.91     0.91
+(0, 1)    |  +0.4997  1.34e-04  8.98e-05   9.90e-05     0.672      0.742    0.88     0.92
+(1, 1)    |  +0.4997  1.96e-04  1.04e-04   1.17e-04     0.531      0.595    0.87     0.89
+(-1, 1)   |  +0.5008  1.09e-04  1.69e-04   1.84e-04     1.550      1.684    0.95     0.96
+(2, 0)    |  +0.5000  2.10e-04  1.18e-04   1.31e-04     0.560      0.622    0.90     0.90
+(0, 2)    |  +0.4997  1.94e-04  1.19e-04   1.33e-04     0.613      0.685    0.89     0.91
+(2, 2)    |  +0.5001  3.42e-04  1.87e-04   2.10e-04     0.547      0.616    0.90     0.92
+(-2, 2)   |  +0.5008  1.41e-04  1.52e-04   1.67e-04     1.081      1.183    0.96     0.96
+
+Resumen agregado (promedio sobre lags H):
+  • ratio_BB medio   =  0.775   (≈1 ideal)
+  • ratio_CBB medio  =  0.855   (≈1 ideal)
+  • cobertura_BB     =  0.907   (≈0.95 ideal)
+  • cobertura_CBB    =  0.921   (≈0.95 ideal)
+  • h* (máx |rho|)   = (-2, 2), |rho_mean| = 0.5008
+
+[BB vs CBB] Escenario base profesional | b = 32
+-----------------------------------------------
+h         | rho_mean   Var_MC      Var*_BB   Var*_CBB   ratio_BB  ratio_CBB  cov_BB  cov_CBB
+--------------------------------------------------------------------------------------------
+(1, 0)    |  +0.4994  1.31e-04  7.54e-05   9.45e-05     0.575      0.721    0.89     0.91
+(0, 1)    |  +0.4996  1.17e-04  7.62e-05   9.49e-05     0.649      0.809    0.88     0.94
+(1, 1)    |  +0.4991  1.55e-04  9.76e-05   1.24e-04     0.630      0.803    0.86     0.91
+(-1, 1)   |  +0.4997  1.14e-04  1.69e-04   1.97e-04     1.479      1.727    0.97     1.00
+(2, 0)    |  +0.4991  1.73e-04  1.08e-04   1.37e-04     0.622      0.791    0.91     0.92
+(0, 2)    |  +0.4992  1.59e-04  1.08e-04   1.36e-04     0.676      0.855    0.88     0.93
+(2, 2)    |  +0.4990  2.77e-04  1.89e-04   2.41e-04     0.682      0.869    0.90     0.95
+(-2, 2)   |  +0.4995  1.43e-04  1.34e-04   1.59e-04     0.932      1.110    0.97     0.99
+
+Resumen agregado (promedio sobre lags H):
+  • ratio_BB medio   =  0.781   (≈1 ideal)
+  • ratio_CBB medio  =  0.961   (≈1 ideal)
+  • cobertura_BB     =  0.907   (≈0.95 ideal)
+  • cobertura_CBB    =  0.944   (≈0.95 ideal)
+  • h* (máx |rho|)   = (-1, 1), |rho_mean| = 0.4997
+
+[BB vs CBB] Escenario base profesional | b = 48
+-----------------------------------------------
+h         | rho_mean   Var_MC      Var*_BB   Var*_CBB   ratio_BB  ratio_CBB  cov_BB  cov_CBB
+--------------------------------------------------------------------------------------------
+(1, 0)    |  +0.4995  1.19e-04  7.33e-05   9.08e-05     0.617      0.764    0.82     0.87
+(0, 1)    |  +0.4999  1.32e-04  7.44e-05   9.12e-05     0.564      0.692    0.80     0.84
+(1, 1)    |  +0.4992  1.61e-04  9.78e-05   1.21e-04     0.608      0.751    0.84     0.89
+(-1, 1)   |  +0.5009  9.28e-05  1.70e-04   1.94e-04     1.832      2.086    0.94     0.95
+(2, 0)    |  +0.4991  1.54e-04  1.05e-04   1.30e-04     0.684      0.847    0.83     0.87
+(0, 2)    |  +0.4993  1.74e-04  1.09e-04   1.33e-04     0.625      0.766    0.82     0.89
+(2, 2)    |  +0.4977  2.65e-04  1.85e-04   2.28e-04     0.701      0.861    0.84     0.90
+(-2, 2)   |  +0.5009  1.15e-04  1.29e-04   1.52e-04     1.119      1.320    0.91     0.93
+
+Resumen agregado (promedio sobre lags H):
+  • ratio_BB medio   =  0.844   (≈1 ideal)
+  • ratio_CBB medio  =  1.011   (≈1 ideal)
+  • cobertura_BB     =  0.850   (≈0.95 ideal)
+  • cobertura_CBB    =  0.892   (≈0.95 ideal)
+  • h* (máx |rho|)   = (-1, 1), |rho_mean| = 0.5009
+
+Selección de b (heurística por calibración CBB):
+  • b óptimo (ratio_CBB medio más cercano a 1) = 48 (score=0.011)
+
+Notas:
+- Este escenario corresponde al diseño profesional propuesto: Matérn LMC bivariante, ν=1, ℓ=7 px, ρ0=0.5, anisotropía 2:1 a 45°,
+  grilla 256×256, B=800, R=100, H direccional corta+múltiplos, preproc z-score + Tukey, comparación BB (Lahiri) vs CBB pareado toroidal.
+- Usa b en {16,32,48} (~0.5 r_eff, r_eff, 1.5 r_eff). La línea final sugiere el b con mejor calibración (ratio_CBB medio ≈ 1).

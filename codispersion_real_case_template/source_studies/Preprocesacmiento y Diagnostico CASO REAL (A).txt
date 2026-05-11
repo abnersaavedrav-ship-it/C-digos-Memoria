@@ -1,0 +1,539 @@
+# Preprocesacmiento y Diagnostico
+## (A) Caso Real
+### Diagnósticos ANTES del Taper (envoltura toroidal)
+
+# === Punto 2: Diagnósticos ANTES del Taper (envoltura toroidal) ===
+# Requisitos: numpy, pillow (PIL), matplotlib, pandas
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+import math
+
+# ---- 1) Carga de imágenes (a,b,c,d) como float32 en [0,1] ----
+paths = {
+    "a": "ch05_nano-a.png",
+    "b": "ch05_nano-b.png",
+    "c": "ch05_nano-c.png",
+    "d": "ch05_nano-d.png",
+}
+def load_gray01(p):
+    A = np.asarray(Image.open(p).convert("L"), dtype=np.float32)
+    return A/255.0 if A.max()>1 else A
+
+A = load_gray01(paths["a"])
+B = load_gray01(paths["b"])
+C = load_gray01(paths["c"])
+D = load_gray01(paths["d"])
+imgs = {"(a)":A,"(b)":B,"(c)":C,"(d)":D}
+
+# ---- 2) Helpers de diagnóstico ----
+def roll_diff(X, h1, h2):  # toroidal
+    return np.roll(X, shift=(h1,h2), axis=(0,1)) - X
+
+def border_center_stats(X, k=10):
+    n1,n2 = X.shape
+    border = np.zeros_like(X, bool)
+    border[:k,:]=True; border[-k:,:]=True; border[:,:k]=True; border[:,-k:]=True
+    center = ~border
+    eps = 1e-9
+    return {
+        "border_mean": float(X[border].mean()),
+        "center_mean": float(X[center].mean()),
+        "rel_diff_mean_%": float(100*(X[border].mean()-X[center].mean())/(X[center].mean()+eps)),
+        "border_std": float(X[border].std()),
+        "center_std": float(X[center].std()),
+    }
+
+def tile_stats(X, T=8):
+    n1,n2 = X.shape; t1=n1//T; t2=n2//T
+    means=[]; vars_=[]
+    for i in range(T):
+        for j in range(T):
+            B = X[i*t1:(i+1)*t1, j*t2:(j+1)*t2]
+            means.append(B.mean()); vars_.append(B.var())
+    means=np.array(means); vars_=np.array(vars_)
+    return {
+        "tile_mean_mean": float(means.mean()),
+        "tile_mean_std": float(means.std()),
+        "tile_var_mean": float(vars_.mean()),
+        "tile_var_min": float(vars_.min()),
+        "tile_var_max": float(vars_.max()),
+        "tile_var_ratio_max_min": float(vars_.max()/(vars_.min()+1e-12)),
+    }
+
+def tile_var_of_increments(X, h=(1,0), T=8):
+    D = roll_diff(X,*h)
+    n1,n2 = D.shape; t1=n1//T; t2=n2//T
+    vv=[]
+    for i in range(T):
+        for j in range(T):
+            B = D[i*t1:(i+1)*t1, j*t2:(j+1)*t2]
+            vv.append(B.var())
+    vv=np.array(vv)
+    return {"h":h, "mean_var": float(vv.mean()), "ratio_max_min": float(vv.max()/(vv.min()+1e-12))}
+
+def variogram_toroidal(X, h):  # γ(h) (omnidireccional con h puntual)
+    D = roll_diff(X,*h)
+    return float((D*D).mean())
+
+def cross_variogram_toroidal(X, Y, h):  # γ_XY(h)
+    DX = roll_diff(X,*h); DY = roll_diff(Y,*h)
+    return float((DX*DY).mean())
+
+def radial_variogram(X, max_r=8):
+    vals={}
+    for h1 in range(-max_r,max_r+1):
+        for h2 in range(-max_r,max_r+1):
+            if h1==0 and h2==0: continue
+            d = math.hypot(h1,h2)
+            if d>max_r: continue
+            g = variogram_toroidal(X,(h1,h2))
+            vals.setdefault(round(d,5), []).append(g)
+    ds=sorted(vals); gammas=[np.mean(vals[d]) for d in ds]
+    return np.array(ds), np.array(gammas)
+
+def radial_cross_variogram(X,Y,max_r=8):
+    vals={}
+    for h1 in range(-max_r,max_r+1):
+        for h2 in range(-max_r,max_r+1):
+            if h1==0 and h2==0: continue
+            d = math.hypot(h1,h2)
+            if d>max_r: continue
+            g = cross_variogram_toroidal(X,Y,(h1,h2))
+            vals.setdefault(round(d,5), []).append(g)
+    ds=sorted(vals); gammas=[np.mean(vals[d]) for d in ds]
+    return np.array(ds), np.array(gammas)
+
+def effective_range(ds, gammas, pct=0.95):
+    k=min(3,len(gammas)); sill=float(np.mean(np.sort(gammas)[-k:]))
+    thr=pct*sill
+    for d,g in zip(ds,gammas):
+        if g>=thr: return float(d)
+    return float(ds[-1])
+
+def codispersion(X,Y,h):
+    DX=roll_diff(X,*h); DY=roll_diff(Y,*h)
+    num=float((DX*DY).sum())
+    den=float(np.sqrt((DX*DX).sum()*(DY*DY).sum()))
+    rho = num/den if den>0 else np.nan
+    Abar=float((DX*DX).mean()); Bbar=float((DY*DY).mean())
+    S = (DX*DY)/np.sqrt(Abar*Bbar+1e-12)  # contribuciones
+    return rho, S
+
+# ---- 3) Estadísticas básicas, borde vs centro y tiles ----
+basic = []
+bvc = []
+tiles = []
+incv = []
+for name,X in imgs.items():
+    basic.append({"image":name, "shape":f"{X.shape[0]}x{X.shape[1]}",
+                  "min":float(X.min()), "max":float(X.max()),
+                  "mean":float(X.mean()), "std":float(X.std())})
+    s = border_center_stats(X, k=10); s["image"]=name; bvc.append(s)
+    t = tile_stats(X, T=8); t["image"]=name; tiles.append(t)
+    for h in [(1,0),(0,1)]:
+        r = tile_var_of_increments(X,h, T=8); r["image"]=name; incv.append(r)
+
+print(pd.DataFrame(basic))
+print(pd.DataFrame(bvc))
+print(pd.DataFrame(tiles))
+print(pd.DataFrame(incv))
+
+__________________________________________________________________________________________________________
+image    shape  min  max      mean       std
+0   (a)  512x512  0.0  1.0  0.431279  0.463646
+1   (b)  512x512  0.0  1.0  0.430638  0.464036
+2   (c)  512x512  0.0  1.0  0.416965  0.477219
+3   (d)  512x512  0.0  1.0  0.419629  0.475181
+   border_mean  center_mean  rel_diff_mean_%  border_std  center_std image
+0          1.0     0.384102       160.347614         0.0    0.451380   (a)
+1          1.0     0.383408       160.818917         0.0    0.451741   (b)
+2          1.0     0.368600       171.296659         0.0    0.464857   (c)
+3          1.0     0.371485       169.189747         0.0    0.462892   (d)
+   tile_mean_mean  tile_mean_std  tile_var_mean  tile_var_min  tile_var_max  \
+0        0.431279       0.421544       0.037269      0.002336      0.092125   
+1        0.430638       0.422073       0.037184      0.002231      0.092172   
+2        0.416965       0.432716       0.040495      0.000671      0.095895   
+3        0.419629       0.430673       0.040318      0.000646      0.095435   
+
+   tile_var_ratio_max_min image  
+0               39.430365   (a)  
+1               41.310471   (b)  
+2              142.921032   (c)  
+3              147.731080   (d)  
+        h  mean_var  ratio_max_min image
+0  (1, 0)  0.006605     114.593929   (a)
+1  (0, 1)  0.006404     130.696239   (a)
+2  (1, 0)  0.006490     119.067614   (b)
+3  (0, 1)  0.006303     127.108271   (b)
+4  (1, 0)  0.006481     490.469647   (c)
+5  (0, 1)  0.006425     240.484621   (c)
+6  (1, 0)  0.006462     426.079054   (d)
+7  (0, 1)  0.006459     227.886075   (d)
+
+__________________________________________________________________________________________________________
+
+# ---- 4) Variogramas radiales y cross (pares a,b y c,d) ----
+for (X,Y,label) in [(A,B,"(a,b)"), (C,D,"(c,d)")]:
+    dsX,gX = radial_variogram(X,8)
+    dsY,gY = radial_variogram(Y,8)
+    dsC,gC = radial_cross_variogram(X,Y,8)
+    plt.figure()
+    plt.plot(dsX,gX,label="gamma_X")
+    plt.plot(dsY,gY,label="gamma_Y")
+    plt.plot(dsC,gC,label="gamma_XY")
+    plt.xlabel("distance (px)"); plt.ylabel("variogram / cross")
+    plt.title(f"Radial variograms {label} — NO Taper")
+    plt.legend(); plt.show()
+
+# ---- 5) Direccionales (0°,90°,45°,135°) hasta k=4 ----
+dirs = [(1,0),(0,1),(1,1),(-1,1)]
+def plot_dir(X, title):
+    plt.figure()
+    for base in dirs:
+        xs=[]; ys=[]
+        for k in range(1,5):
+            h=(base[0]*k, base[1]*k)
+            xs.append(k); ys.append(variogram_toroidal(X,h))
+        plt.plot(xs,ys,label=f"dir {base}")
+    plt.xlabel("k"); plt.ylabel("variogram"); plt.title(title); plt.legend(); plt.show()
+
+plot_dir(A,"Directional variograms — X (a) — NO Taper")
+plot_dir(B,"Directional variograms — Y (b) — NO Taper")
+
+
+# ---- 6) r_eff (95%) y propuesta de H (cap a 2 px) ----
+r_eff = {}
+for name,X in imgs.items():
+    ds,g = radial_variogram(X,8)
+    r_eff[name] = effective_range(ds,g,0.95)
+print("r_eff(95%) por imagen:", r_eff)
+
+def propose_H(r_eff_min, cap=2):
+    hmax = min(max(1, int(np.floor(0.5*r_eff_min))), cap)
+    H=set()
+    for base in dirs:
+        for k in range(1,hmax+1):
+            H.add((base[0]*k, base[1]*k))
+    return sorted(H), hmax
+
+r_ab = min(r_eff["(a)"], r_eff["(b)"])
+r_cd = min(r_eff["(c)"], r_eff["(d)"])
+H_ab, hmax_ab = propose_H(r_ab, cap=2)
+H_cd, hmax_cd = propose_H(r_cd, cap=2)
+print("Propuesta H (a,b):", H_ab, "hmax=",hmax_ab)
+print("Propuesta H (c,d):", H_cd, "hmax=",hmax_cd)
+__________________________________________________________________________________________________________
+
+r_eff(95%) por imagen: {'(a)': 7.2111, '(b)': 7.2111, '(c)': 7.2111, '(d)': 7.2111}
+Propuesta H (a,b): [(-2, 2), (-1, 1), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 2)] hmax= 2
+Propuesta H (c,d): [(-2, 2), (-1, 1), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 2)] hmax= 2
+
+__________________________________________________________________________________________________________
+
+# ---- 7) Codispersión por H y mapa de contribuciones (a,b) en h=(1,0) ----
+def codisp_table(X,Y,H):
+    rows=[]
+    for h in H:
+        r,_ = codispersion(X,Y,h)
+        rows.append({"h":h, "rho_hat":r})
+    return pd.DataFrame(rows)
+
+print("Codispersion (a,b):\n", codisp_table(A,B,H_ab))
+print("Codispersion (c,d):\n", codisp_table(C,D,H_cd))
+
+rho10, S10 = codispersion(A,B,(1,0))
+plt.figure(); plt.imshow(S10); plt.title(f"s(i) — (a,b), h=(1,0); rho={rho10:.3f}")
+plt.axis("off"); plt.show()
+
+__________________________________________________________________________________________________________
+
+Codispersion (a,b):
+          h   rho_hat
+0  (-2, 2)  0.954853
+1  (-1, 1)  0.929753
+2   (0, 1)  0.892141
+3   (0, 2)  0.928841
+4   (1, 0)  0.895384
+5   (1, 1)  0.928533
+6   (2, 0)  0.929996
+7   (2, 2)  0.954456
+Codispersion (c,d):
+          h   rho_hat
+0  (-2, 2)  0.962227
+1  (-1, 1)  0.939040
+2   (0, 1)  0.909774
+3   (0, 2)  0.941623
+4   (1, 0)  0.905728
+5   (1, 1)  0.939051
+6   (2, 0)  0.939802
+7   (2, 2)  0.962317
+
+__________________________________________________________________________________________________________
+
+### Diagnósticos DESPUÉS del Taper (Tukey 2D de 8 px)
+# --- Carga (igual que antes) ---
+paths = {
+    "a": "ch05_nano-a.png",
+    "b": "ch05_nano-b.png",
+    "c": "ch05_nano-c.png",
+    "d": "ch05_nano-d.png",
+}
+def load_gray01(p):
+    A = np.asarray(Image.open(p).convert("L"), dtype=np.float32)
+    return A/255.0 if A.max()>1 else A
+
+A0 = load_gray01(paths["a"]); B0 = load_gray01(paths["b"])
+C0 = load_gray01(paths["c"]); D0 = load_gray01(paths["d"])
+
+# --- Taper: ventana Tukey 2D de k píxeles en cada borde ---
+def tukey_1d(N, k):
+    # alpha tal que cada lado tenga ~k píxeles de coseno
+    alpha = min(1.0, max(0.0, 2.0*k/max(1,N-1)))
+    n = np.arange(N, dtype=np.float32)
+    if alpha <= 0.0: return np.ones(N, np.float32)
+    if alpha >= 1.0: return 0.5*(1-np.cos(2*np.pi*n/(N-1))).astype(np.float32)
+    w = np.ones(N, np.float32)
+    edge = int(np.floor(alpha*(N-1)/2))
+    for i in range(edge):
+        w[i] = 0.5*(1+np.cos(np.pi*(2*i/(alpha*(N-1))-1)))
+        w[-(i+1)] = w[i]
+    return w
+
+def tukey2d(n1,n2,k):
+    return np.outer(tukey_1d(n1,k), tukey_1d(n2,k)).astype(np.float32)
+
+k_taper = 8
+W_A = tukey2d(*A0.shape, k_taper)
+A = A0 * W_A; B = B0 * W_A  # mismo taper para ambos
+W_C = tukey2d(*C0.shape, k_taper)
+C = C0 * W_C; D = D0 * W_C
+imgs = {"(a)":A,"(b)":B,"(c)":C,"(d)":D}
+
+
+# --- Helpers (idénticos al bloque 1) ---
+def roll_diff(X,h1,h2): return np.roll(X,(h1,h2),(0,1)) - X
+def border_center_stats(X, k=10):
+    n1,n2 = X.shape
+    border = np.zeros_like(X, bool)
+    border[:k,:]=True; border[-k:,:]=True; border[:,:k]=True; border[:,-k:]=True
+    center = ~border
+    eps=1e-9
+    return {"border_mean": float(X[border].mean()),
+            "center_mean": float(X[center].mean()),
+            "rel_diff_mean_%": float(100*(X[border].mean()-X[center].mean())/(X[center].mean()+eps)),
+            "border_std": float(X[border].std()),
+            "center_std": float(X[center].std())}
+def tile_stats(X, T=8):
+    n1,n2=X.shape; t1=n1//T; t2=n2//T
+    means=[]; vars_=[]
+    for i in range(T):
+        for j in range(T):
+            Bk = X[i*t1:(i+1)*t1, j*t2:(j+1)*t2]
+            means.append(Bk.mean()); vars_.append(Bk.var())
+    means=np.array(means); vars_=np.array(vars_)
+    return {"tile_mean_mean": float(means.mean()),
+            "tile_mean_std": float(means.std()),
+            "tile_var_mean": float(vars_.mean()),
+            "tile_var_min": float(vars_.min()),
+            "tile_var_max": float(vars_.max()),
+            "tile_var_ratio_max_min": float(vars_.max()/(vars_.min()+1e-12))}
+def tile_var_of_increments(X,h=(1,0),T=8):
+    D = roll_diff(X,*h)
+    n1,n2=D.shape; t1=n1//T; t2=n2//T
+    vv=[]
+    for i in range(T):
+        for j in range(T):
+            vv.append(D[i*t1:(i+1)*t1, j*t2:(j+1)*t2].var())
+    vv=np.array(vv)
+    return {"h":h, "mean_var": float(vv.mean()), "ratio_max_min": float(vv.max()/(vv.min()+1e-12))}
+def variogram_toroidal(X,h): return float((roll_diff(X,*h)**2).mean())
+def cross_variogram_toroidal(X,Y,h):
+    DX=roll_diff(X,*h); DY=roll_diff(Y,*h); return float((DX*DY).mean())
+def radial_variogram(X,max_r=8):
+    vals={}
+    for h1 in range(-max_r,max_r+1):
+        for h2 in range(-max_r,max_r+1):
+            if h1==0 and h2==0: continue
+            d=math.hypot(h1,h2)
+            if d>max_r: continue
+            g=variogram_toroidal(X,(h1,h2))
+            vals.setdefault(round(d,5), []).append(g)
+    ds=sorted(vals); gammas=[np.mean(vals[d]) for d in ds]
+    return np.array(ds), np.array(gammas)
+def radial_cross_variogram(X,Y,max_r=8):
+    vals={}
+    for h1 in range(-max_r,max_r+1):
+        for h2 in range(-max_r,max_r+1):
+            if h1==0 and h2==0: continue
+            d=math.hypot(h1,h2)
+            if d>max_r: continue
+            g=cross_variogram_toroidal(X,Y,(h1,h2))
+            vals.setdefault(round(d,5), []).append(g)
+    ds=sorted(vals); gammas=[np.mean(vals[d]) for d in ds]
+    return np.array(ds), np.array(gammas)
+def effective_range(ds,gammas,pct=0.95):
+    k=min(3,len(gammas)); sill=float(np.mean(np.sort(gammas)[-k:]))
+    thr=pct*sill
+    for d,g in zip(ds,gammas):
+        if g>=thr: return float(d)
+    return float(ds[-1])
+def codispersion(X,Y,h):
+    DX=roll_diff(X,*h); DY=roll_diff(Y,*h)
+    num=float((DX*DY).sum()); den=float(np.sqrt((DX*DX).sum()*(DY*DY).sum()))
+    rho = num/den if den>0 else np.nan
+    Abar=float((DX*DX).mean()); Bbar=float((DY*DY).mean())
+    S = (DX*DY)/np.sqrt(Abar*Bbar+1e-12)
+    return rho, S
+
+# --- 1) Tablas de stats/tiles/bordes ---
+basic=[]; bvc=[]; tiles=[]; incv=[]
+for name,X in imgs.items():
+    basic.append({"image":name+" (tapered)", "shape":f"{X.shape[0]}x{X.shape[1]}",
+                  "min":float(X.min()), "max":float(X.max()),
+                  "mean":float(X.mean()), "std":float(X.std())})
+    s=border_center_stats(X,10); s["image"]=name+" (tapered)"; bvc.append(s)
+    t=tile_stats(X,8); t["image"]=name+" (tapered)"; tiles.append(t)
+    for h in [(1,0),(0,1)]:
+        r=tile_var_of_increments(X,h,8); r["image"]=name+" (tapered)"; incv.append(r)
+
+print(pd.DataFrame(basic))
+print(pd.DataFrame(bvc))
+print(pd.DataFrame(tiles))
+print(pd.DataFrame(incv))
+__________________________________________________________________________________________________________
+
+
+image    shape  min  max      mean       std
+0  (a) (tapered)  512x512  0.0  1.0  0.396432  0.448669
+1  (b) (tapered)  512x512  0.0  1.0  0.395791  0.449022
+2  (c) (tapered)  512x512  0.0  1.0  0.382118  0.461603
+3  (d) (tapered)  512x512  0.0  1.0  0.384782  0.459697
+   border_mean  center_mean  rel_diff_mean_%  border_std  center_std  \
+0      0.54507     0.384102        41.907599    0.384667    0.451380   
+1      0.54507     0.383408        42.164488    0.384667    0.451741   
+2      0.54507     0.368600        47.875587    0.384667    0.464857   
+3      0.54507     0.371485        46.727173    0.384667    0.462892   
+
+           image  
+0  (a) (tapered)  
+1  (b) (tapered)  
+2  (c) (tapered)  
+3  (d) (tapered)  
+   tile_mean_mean  tile_mean_std  tile_var_mean  tile_var_min  tile_var_max  \
+0        0.396432       0.381537       0.055733      0.002336      0.126922   
+1        0.395791       0.382067       0.055646      0.002231      0.126963   
+2        0.382118       0.392725       0.058844      0.000671      0.130382   
+3        0.384782       0.390686       0.058686      0.000646      0.129959   
+
+   tile_var_ratio_max_min          image  
+0               54.323698  (a) (tapered)  
+1               56.903672  (b) (tapered)  
+2              194.319678  (c) (tapered)  
+3              201.172021  (d) (tapered)  
+        h  mean_var  ratio_max_min          image
+0  (1, 0)  0.007219     132.368565  (a) (tapered)
+1  (0, 1)  0.007017     151.082929  (a) (tapered)
+2  (1, 0)  0.007103     137.845113  (b) (tapered)
+3  (0, 1)  0.006916     146.755734  (b) (tapered)
+4  (1, 0)  0.007096     490.469647  (c) (tapered)
+5  (0, 1)  0.007040     240.484621  (c) (tapered)
+6  (1, 0)  0.007076     426.079054  (d) (tapered)
+7  (0, 1)  0.007074     227.886075  (d) (tapered)
+
+
+__________________________________________________________________________________________________________
+
+# --- 2) Variogramas radiales y cross (pares a,b y c,d) ---
+for (X,Y,label) in [(A,B,"(a,b)"), (C,D,"(c,d)")]:
+    dsX,gX = radial_variogram(X,8)
+    dsY,gY = radial_variogram(Y,8)
+    dsC,gC = radial_cross_variogram(X,Y,8)
+    plt.figure()
+    plt.plot(dsX,gX,label="gamma_X (tapered)")
+    plt.plot(dsY,gY,label="gamma_Y (tapered)")
+    plt.plot(dsC,gC,label="gamma_XY (tapered)")
+    plt.xlabel("distance (px)"); plt.ylabel("variogram / cross")
+    plt.title(f"Radial variograms {label} — Tapered")
+    plt.legend(); plt.show()
+
+# --- 3) Direccionales (hasta k=4) para (a) y (b) ---
+def plot_dir(X,title):
+    plt.figure()
+    for base in [(1,0),(0,1),(1,1),(-1,1)]:
+        xs=[]; ys=[]
+        for k in range(1,5):
+            h=(base[0]*k, base[1]*k)
+            xs.append(k); ys.append(variogram_toroidal(X,h))
+        plt.plot(xs,ys,label=f"dir {base}")
+    plt.xlabel("k"); plt.ylabel("variogram"); plt.title(title); plt.legend(); plt.show()
+
+plot_dir(A,"Directional variograms — X (a) — Tapered")
+plot_dir(B,"Directional variograms — Y (b) — Tapered")
+
+# --- 4) r_eff (95%) y H propuesta (cap=2) ---
+r_eff={}
+for name,X in imgs.items():
+    ds,g = radial_variogram(X,8)
+    r_eff[name]=effective_range(ds,g,0.95)
+print("r_eff(95%) (tapered):", r_eff)
+
+def propose_H(r_eff_min, cap=2):
+    hmax = min(max(1,int(np.floor(0.5*r_eff_min))), cap)
+    H=set()
+    for base in [(1,0),(0,1),(1,1),(-1,1)]:
+        for k in range(1,hmax+1):
+            H.add((base[0]*k, base[1]*k))
+    return sorted(H), hmax
+
+r_ab = min(r_eff["(a)"], r_eff["(b)"])
+r_cd = min(r_eff["(c)"], r_eff["(d)"])
+H_ab, hmax_ab = propose_H(r_ab,2)
+H_cd, hmax_cd = propose_H(r_cd,2)
+print("Propuesta H (a,b) — tapered:", H_ab, "hmax=",hmax_ab)
+print("Propuesta H (c,d) — tapered:", H_cd, "hmax=",hmax_cd)
+
+__________________________________________________________________________________________________________
+
+r_eff(95%) (tapered): {'(a)': 7.2111, '(b)': 7.2111, '(c)': 7.2111, '(d)': 7.2111}
+Propuesta H (a,b) — tapered: [(-2, 2), (-1, 1), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 2)] hmax= 2
+Propuesta H (c,d) — tapered: [(-2, 2), (-1, 1), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 2)] hmax= 2
+
+__________________________________________________________________________________________________________
+
+# --- 5) Codispersión por H y mapa de contribuciones (a,b), h=(1,0) ---
+def codisp_table(X,Y,H):
+    return pd.DataFrame([{"h":h, "rho_hat": codispersion(X,Y,h)[0]} for h in H])
+
+print("Codispersion (a,b) — tapered:\n", codisp_table(A,B,H_ab))
+print("Codispersion (c,d) — tapered:\n", codisp_table(C,D,H_cd))
+
+rho10, S10 = codispersion(A,B,(1,0))
+plt.figure(); plt.imshow(S10); plt.title(f"s(i) — (a,b), h=(1,0); rho={rho10:.3f} — Tapered")
+plt.axis("off"); plt.show()
+
+__________________________________________________________________________________________________________
+
+Codispersion (a,b) — tapered:
+          h   rho_hat
+0  (-2, 2)  0.964205
+1  (-1, 1)  0.936658
+2   (0, 1)  0.901134
+3   (0, 2)  0.941196
+4   (1, 0)  0.903871
+5   (1, 1)  0.935696
+6   (2, 0)  0.941790
+7   (2, 2)  0.963978
+Codispersion (c,d) — tapered:
+          h   rho_hat
+0  (-2, 2)  0.969657
+1  (-1, 1)  0.944975
+2   (0, 1)  0.917203
+3   (0, 2)  0.951202
+4   (1, 0)  0.913458
+5   (1, 1)  0.944977
+6   (2, 0)  0.949531
+7   (2, 2)  0.969747
+

@@ -1,0 +1,330 @@
+Preprocesacmiento y Diagnostico Sintéticos controlados (B)
+
+# ============================================================
+# Kit B — Sintéticos controlados (Punto 2: Preproc + Diagnósticos)
+# Modelos:
+#   M1: Alineación fuerte con ruido  (Y = c·X + ε)
+#   M2: Rangos distintos             (X y Y comparten señal pero con suavizados distintos)
+#   M3: Anisotropía                  (Y con rango direccional; X casi isotrópico)
+# Pipeline (toroidal + taper): stats, tiles, variogramas (radial/direccional),
+# cross-variograma, r_eff(95%), propuesta H (cap=2), codispersión por H y mapa s(i).
+# Requisitos: numpy, pandas, matplotlib
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+
+# ---------- Utilidades: ventana Tukey, kernel gaussiano, conv. FFT toroidal ----------
+def tukey_1d(N, k):
+    alpha = min(1.0, max(0.0, 2.0 * k / max(1, N - 1)))
+    n = np.arange(N, dtype=np.float32)
+    if alpha <= 0.0:
+        return np.ones(N, np.float32)
+    if alpha >= 1.0:
+        return 0.5 * (1 - np.cos(2*np.pi*n/(N-1))).astype(np.float32)
+    w = np.ones(N, np.float32)
+    edge = int(np.floor(alpha * (N - 1) / 2.0))
+    for i in range(edge):
+        w[i] = 0.5 * (1 + np.cos(np.pi * (2*i/(alpha*(N-1)) - 1)))
+        w[-(i+1)] = w[i]
+    return w
+
+def tukey2d(n1, n2, k):
+    return np.outer(tukey_1d(n1, k), tukey_1d(n2, k)).astype(np.float32)
+
+def gaussian_kernel_2d(sx, sy=None, theta_deg=0.0, tol=1e-3):
+    if sy is None: sy = sx
+    theta = np.deg2rad(theta_deg)
+    R = int(np.ceil(1.2 * max(3, int(np.ceil(3.5*sx)), 3, int(np.ceil(3.5*sy)))))
+    xs = np.arange(-R, R+1, dtype=np.float32)
+    ys = np.arange(-R, R+1, dtype=np.float32)
+    X, Y = np.meshgrid(xs, ys, indexing="xy")
+    c, s = np.cos(theta), np.sin(theta)
+    Xp =  c*X + s*Y
+    Yp = -s*X + c*Y
+    K = np.exp(-0.5 * ((Xp/sx)**2 + (Yp/sy)**2))
+    K /= K.max()
+    K *= (K >= tol)
+    K /= (K.sum() + 1e-12)
+    return K.astype(np.float32)
+
+def fftconv2(a, k):
+    """Convolución circular (toroidal) vía FFT, salida del mismo tamaño."""
+    pad = np.zeros_like(a, dtype=np.float32)
+    kh, kw = k.shape
+    pad[:kh, :kw] = k
+    pad = np.roll(np.roll(pad, -kh//2, axis=0), -kw//2, axis=1)
+    A = np.fft.rfft2(a); K = np.fft.rfft2(pad)
+    return np.fft.irfft2(A*K, s=a.shape).astype(np.float32)
+
+# ---------- Diagnósticos (toroidal) ----------
+def roll_diff(X, h1, h2):
+    return np.roll(X, shift=(h1, h2), axis=(0,1)) - X
+
+def tile_stats(X, T=8):
+    n1,n2 = X.shape; t1=n1//T; t2=n2//T
+    means, vars_ = [], []
+    for i in range(T):
+        for j in range(T):
+            B = X[i*t1:(i+1)*t1, j*t2:(j+1)*t2]
+            means.append(B.mean()); vars_.append(B.var())
+    means = np.array(means); vars_ = np.array(vars_)
+    return {
+        "tile_mean_std": float(means.std()),
+        "tile_var_ratio_max_min": float(vars_.max()/(vars_.min()+1e-12))
+    }
+
+def tile_var_of_increments(X, h, T=8):
+    D = roll_diff(X, *h)
+    n1,n2=D.shape; t1=n1//T; t2=n2//T
+    vv=[]
+    for i in range(T):
+        for j in range(T):
+            vv.append(D[i*t1:(i+1)*t1, j*t2:(j+1)*t2].var())
+    vv=np.array(vv)
+    return float(vv.max()/(vv.min()+1e-12))
+
+def variogram_toroidal(X, h):
+    D = roll_diff(X, *h)
+    return float((D*D).mean())
+
+def cross_variogram_toroidal(X, Y, h):
+    DX = roll_diff(X, *h); DY = roll_diff(Y, *h)
+    return float((DX*DY).mean())
+
+def radial_variogram(X, max_r=8):
+    vals={}
+    for h1 in range(-max_r,max_r+1):
+        for h2 in range(-max_r,max_r+1):
+            if h1==0 and h2==0: continue
+            d = math.hypot(h1,h2)
+            if d>max_r: continue
+            vals.setdefault(d, []).append(variogram_toroidal(X,(h1,h2)))
+    ds = sorted(vals)
+    gammas = [float(np.mean(vals[d])) for d in ds]
+    return np.array(ds), np.array(gammas)
+
+def radial_cross_variogram(X,Y,max_r=8):
+    vals={}
+    for h1 in range(-max_r,max_r+1):
+        for h2 in range(-max_r,max_r+1):
+            if h1==0 and h2==0: continue
+            d = math.hypot(h1,h2)
+            if d>max_r: continue
+            vals.setdefault(d, []).append(cross_variogram_toroidal(X,Y,(h1,h2)))
+    ds = sorted(vals)
+    gammas = [float(np.mean(vals[d])) for d in ds]
+    return np.array(ds), np.array(gammas)
+
+def effective_range(ds, gammas, pct=0.95):
+    k = min(3, len(gammas))
+    sill = float(np.mean(np.sort(gammas)[-k:]))
+    thr = pct*sill
+    for d,g in zip(ds, gammas):
+        if g >= thr: return float(d)
+    return float(ds[-1])
+
+def propose_H(r_eff, cap=2):
+    hmax = min(max(1,int(np.floor(0.5*r_eff))), cap)
+    H=set()
+    for base in [(1,0),(0,1),(1,1),(-1,1)]:
+        for k in range(1,hmax+1):
+            H.add((base[0]*k, base[1]*k))
+    return sorted(H), hmax
+
+def codispersion(X,Y,h):
+    DX=roll_diff(X,*h); DY=roll_diff(Y,*h)
+    num=float((DX*DY).sum())
+    den=float(np.sqrt((DX*DX).sum()*(DY*DY).sum()))
+    rho = num/den if den>0 else np.nan
+    Abar=float((DX*DX).mean()); Bbar=float((DY*DY).mean())
+    S = (DX*DY)/(np.sqrt(Abar*Bbar)+1e-12)  # contribuciones s(i)
+    return rho, S
+
+def codisp_table(X,Y,H):
+    return pd.DataFrame([{"h":h, "rho_hat": codispersion(X,Y,h)[0]} for h in H])
+
+def plot_directionals(X, title, L=4):
+    plt.figure()
+    for base in [(1,0),(0,1),(1,1),(-1,1)]:
+        xs, ys = [], []
+        for k in range(1,L+1):
+            h=(base[0]*k, base[1]*k)
+            xs.append(k); ys.append(variogram_toroidal(X,h))
+        plt.plot(xs,ys,label=f"dir {base}")
+    plt.xlabel("k"); plt.ylabel("variogram"); plt.title(title); plt.legend(); plt.show()
+
+# ---------- Generadores de modelos sintéticos ----------
+rng = np.random.default_rng(123)
+
+def smooth_field(white, sx, sy=None, theta=0.0):
+    K = gaussian_kernel_2d(sx, sy if sy is not None else sx, theta_deg=theta, tol=1e-3)
+    return fftconv2(white, K)
+
+def standardize(X):
+    X = X - X.mean()
+    s = X.std()
+    return (X/s if s>0 else X).astype(np.float32)
+
+def model1(n=256, c=0.8, sigma_x=3.0, sigma_eps=2.0, noise_ratio=0.25, taper_k=8):
+    W = rng.standard_normal((n,n)).astype(np.float32)
+    X0 = standardize(smooth_field(W, sigma_x))
+    E  = rng.standard_normal((n,n)).astype(np.float32)
+    eps = standardize(smooth_field(E, sigma_eps)) * noise_ratio
+    X = X0
+    Y = c*X0 + eps
+    Wt = tukey2d(n,n,taper_k)
+    return X*Wt, Y*Wt
+
+def model2(n=256, sx_x=2.0, sx_y=5.0, alpha=1.0, noise_ratio=0.15, taper_k=8):
+    G  = rng.standard_normal((n,n)).astype(np.float32)
+    X  = standardize(smooth_field(G, sx_x))
+    Y0 = standardize(smooth_field(G, sx_y))
+    N  = standardize(smooth_field(rng.standard_normal((n,n)).astype(np.float32), 2.0)) * noise_ratio
+    Y  = alpha*Y0 + N
+    Wt = tukey2d(n,n,taper_k)
+    return X*Wt, Y*Wt
+
+def model3(n=256, sx_iso=2.2, sy_an=2.0, sx_an=6.0, theta=45.0, noise_ratio=0.12, taper_k=8):
+    G  = rng.standard_normal((n,n)).astype(np.float32)
+    X  = standardize(smooth_field(G, sx_iso))                   # casi isotrópico
+    Y0 = standardize(smooth_field(G, sx_an, sy=sy_an, theta=theta))  # anisotrópico
+    N  = standardize(smooth_field(rng.standard_normal((n,n)).astype(np.float32), 2.0)) * noise_ratio
+    Y  = Y0 + N
+    Wt = tukey2d(n,n,taper_k)
+    return X*Wt, Y*Wt
+
+# ---------- Ejecución del pipeline sobre los 3 modelos ----------
+models = {
+    "M1: alignment + noise": model1(),
+    "M2: different ranges" : model2(),
+    "M3: anisotropy"       : model3(),
+}
+
+summary = []
+for name, (X, Y) in models.items():
+    # (a) Tiles y varianza de incrementos
+    tilesX = tile_stats(X, T=8); tilesY = tile_stats(Y, T=8)
+    rX10 = tile_var_of_increments(X, (1,0), 8)
+    rX01 = tile_var_of_increments(X, (0,1), 8)
+    rY10 = tile_var_of_increments(Y, (1,0), 8)
+    rY01 = tile_var_of_increments(Y, (0,1), 8)
+
+    # (b) Variogramas radiales y cross
+    dsX,gX = radial_variogram(X, 8)
+    dsY,gY = radial_variogram(Y, 8)
+    dsC,gC = radial_cross_variogram(X, Y, 8)
+    plt.figure()
+    plt.plot(dsX,gX,label="gamma_X")
+    plt.plot(dsY,gY,label="gamma_Y")
+    plt.plot(dsC,gC,label="gamma_XY")
+    plt.xlabel("distance (px)"); plt.ylabel("variogram / cross")
+    plt.title(f"Radial variograms — {name}"); plt.legend(); plt.show()
+
+    # (c) Direccionales
+    plot_directionals(X, f"Directional variograms — X — {name}", L=4)
+    plot_directionals(Y, f"Directional variograms — Y — {name}", L=4)
+
+    # (d) r_eff y H
+    r_eff_X = effective_range(dsX, gX, 0.95)
+    r_eff_Y = effective_range(dsY, gY, 0.95)
+    rmin    = min(r_eff_X, r_eff_Y)
+    H, hmax = propose_H(rmin, cap=2)
+
+    # (e) Codispersión y mapa s(i) para h=(1,0)
+    tab = codisp_table(X, Y, H)
+    print(f"\nCodispersion per lag — {name}\n", tab, "\n")
+    rho10, S10 = codispersion(X, Y, (1,0))
+    plt.figure(); plt.imshow(S10); plt.axis("off")
+    plt.title(f"s(i) for h=(1,0) — {name}; rho={rho10:.3f}")
+    plt.show()
+
+    # Resumen
+    exp = ("High rho (short lags); gamma_X≈gamma_Y; gamma_XY close to both." if "alignment" in name
+           else "Different ranges: gamma_X vs gamma_Y separated; gamma_XY positive between them."
+           if "different" in name else
+           "Anisotropy in Y: directional variograms of Y differ; X near isotropic; gamma_XY positive at short lags.")
+    summary.append({
+        "model": name,
+        "X_std": float(X.std()), "Y_std": float(Y.std()),
+        "tileVarRatio_X": tilesX["tile_var_ratio_max_min"],
+        "tileVarRatio_Y": tilesY["tile_var_ratio_max_min"],
+        "incVarRatio_X(1,0)": rX10, "incVarRatio_X(0,1)": rX01,
+        "incVarRatio_Y(1,0)": rY10, "incVarRatio_Y(0,1)": rY01,
+        "r_eff_X(95%)": r_eff_X, "r_eff_Y(95%)": r_eff_Y,
+        "hmax": hmax, "H": H, "rho(1,0)": rho10,
+        "expected_pattern": exp
+    })
+
+# Tabla resumen
+summary_df = pd.DataFrame(summary)
+print("\nSynthetic models — summary of diagnostics\n", summary_df)
+
+__________________________________________________________________________________________________________
+
+Codispersion per lag — M1: alignment + noise
+          h   rho_hat
+0  (-2, 2)  0.916559
+1  (-1, 1)  0.909360
+2   (0, 1)  0.908251
+3   (0, 2)  0.912075
+4   (1, 0)  0.906794
+5   (1, 1)  0.908572
+6   (2, 0)  0.910792
+7   (2, 2)  0.916403
+
+__________________________________________________________________________________________________________
+
+Codispersion per lag — M2: different ranges
+          h   rho_hat
+0  (-2, 2)  0.485471
+1  (-1, 1)  0.457201
+2   (0, 1)  0.447755
+3   (0, 2)  0.462707
+4   (1, 0)  0.447452
+5   (1, 1)  0.447584
+6   (2, 0)  0.461666
+7   (2, 2)  0.475374
+
+__________________________________________________________________________________________________________
+
+Codispersion per lag — M3: anisotropy
+          h   rho_hat
+0  (-2, 2)  0.796132
+1  (-1, 1)  0.795461
+2   (0, 1)  0.646516
+3   (0, 2)  0.654981
+4   (1, 0)  0.645711
+5   (1, 1)  0.485487
+6   (2, 0)  0.654269
+7   (2, 2)  0.515279
+
+__________________________________________________________________________________________________________
+
+Synthetic models — summary of diagnostics
+                    model     X_std     Y_std  tileVarRatio_X  tileVarRatio_Y  \
+0  M1: alignment + noise  0.962307  0.807840        4.274779        3.323455   
+1   M2: different ranges  0.953492  0.953309        4.475361        8.551709   
+2         M3: anisotropy  0.959881  0.962967        3.480400        5.677847   
+
+   incVarRatio_X(1,0)  incVarRatio_X(0,1)  incVarRatio_Y(1,0)  \
+0            3.991030            3.096698            3.012255   
+1            2.422952            2.992179            7.547729   
+2            3.142381            2.440115            7.347016   
+
+   incVarRatio_Y(0,1)  r_eff_X(95%)  r_eff_Y(95%)  hmax  \
+0            2.563210      7.615773      7.615773     2   
+1            4.654618      6.708204      7.615773     2   
+2            6.865308      7.000000      7.000000     2   
+
+                                                   H  rho(1,0)  \
+0  [(-2, 2), (-1, 1), (0, 1), (0, 2), (1, 0), (1,...  0.906794   
+1  [(-2, 2), (-1, 1), (0, 1), (0, 2), (1, 0), (1,...  0.447452   
+2  [(-2, 2), (-1, 1), (0, 1), (0, 2), (1, 0), (1,...  0.645711   
+
+                                    expected_pattern  
+0  High rho (short lags); gamma_X≈gamma_Y; gamma_...  
+1  Different ranges: gamma_X vs gamma_Y separated...  
+2  Anisotropy in Y: directional variograms of Y d...

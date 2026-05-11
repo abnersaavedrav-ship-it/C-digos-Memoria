@@ -1,0 +1,241 @@
+Preprocesacmiento y Diagnostico Micro-datos — Test unitario Rank-1 (C)
+
+# ============================================================
+# C) Micro-datos — Test unitario Rank-1 (Punto 2: Preproc + Diagnósticos)
+# Casos:
+#   1) Y = X   (alineación perfecta)  →  ρ(h) = +1, γXY = γX = γY
+#   2) Y = -X  (anti-alineación)      →  ρ(h) = -1, γXY = -γX = -γY
+#
+# Pipeline (toroidal + Tukey 8 px):
+#   - variogramas radiales y cross, r_eff(95%), selección H (cap=2)
+#   - codispersión por H, comparación pre/post Taper
+#   - chequeos automáticos: |ρ±1|, γXY vs (±)γX,γY, efecto del taper
+#
+# Requisitos: numpy, pandas, matplotlib
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+
+# ---------- Utilidades básicas ----------
+def gaussian_kernel_2d(sx, sy=None, theta_deg=0.0, tol=1e-3):
+    """Núcleo gaussiano 2D anisotrópico rotado, normalizado a suma 1."""
+    if sy is None: sy = sx
+    theta = np.deg2rad(theta_deg)
+    R = int(np.ceil(1.2 * max(3, int(np.ceil(3.5*sx)), 3, int(np.ceil(3.5*sy)))))
+    xs = np.arange(-R, R+1, dtype=np.float32)
+    ys = np.arange(-R, R+1, dtype=np.float32)
+    X, Y = np.meshgrid(xs, ys, indexing="xy")
+    c, s = np.cos(theta), np.sin(theta)
+    Xp =  c*X + s*Y
+    Yp = -s*X + c*Y
+    K = np.exp(-0.5 * ((Xp/sx)**2 + (Yp/sy)**2))
+    K /= K.max()
+    K *= (K >= tol)
+    K /= (K.sum() + 1e-12)
+    return K.astype(np.float32)
+
+def fftconv2(a, k):
+    """Convolución circular (toroidal) vía FFT, salida del mismo tamaño."""
+    pad = np.zeros_like(a, dtype=np.float32)
+    kh, kw = k.shape
+    pad[:kh, :kw] = k
+    pad = np.roll(np.roll(pad, -kh//2, axis=0), -kw//2, axis=1)  # centrar
+    A = np.fft.rfft2(a); K = np.fft.rfft2(pad)
+    return np.fft.irfft2(A*K, s=a.shape).astype(np.float32)
+
+def roll_diff(X, h1, h2):
+    return np.roll(X, shift=(h1,h2), axis=(0,1)) - X
+
+# ---------- Variogramas y codispersión (toroidal) ----------
+def variogram_toroidal(X, h):
+    D = roll_diff(X, *h)
+    return float((D*D).mean())
+
+def cross_variogram_toroidal(X, Y, h):
+    DX = roll_diff(X, *h); DY = roll_diff(Y, *h)
+    return float((DX*DY).mean())
+
+def radial_variogram(X, max_r=8):
+    vals={}
+    for h1 in range(-max_r, max_r+1):
+        for h2 in range(-max_r, max_r+1):
+            if h1==0 and h2==0: continue
+            d = math.hypot(h1,h2)
+            if d>max_r: continue
+            vals.setdefault(d, []).append(variogram_toroidal(X,(h1,h2)))
+    ds = sorted(vals); gammas = [float(np.mean(vals[d])) for d in ds]
+    return np.array(ds), np.array(gammas)
+
+def radial_cross_variogram(X, Y, max_r=8):
+    vals={}
+    for h1 in range(-max_r, max_r+1):
+        for h2 in range(-max_r, max_r+1):
+            if h1==0 and h2==0: continue
+            d = math.hypot(h1,h2)
+            if d>max_r: continue
+            vals.setdefault(d, []).append(cross_variogram_toroidal(X,Y,(h1,h2)))
+    ds = sorted(vals); gammas = [float(np.mean(vals[d])) for d in ds]
+    return np.array(ds), np.array(gammas)
+
+def effective_range(ds, gammas, pct=0.95):
+    """Rango efectivo no paramétrico: 1er r con γ(r)≥pct*sill (sill≈promedio top-3)."""
+    k = min(3, len(gammas))
+    sill = float(np.mean(np.sort(gammas)[-k:]))
+    thr = pct*sill
+    for d,g in zip(ds, gammas):
+        if g >= thr: return float(d)
+    return float(ds[-1])
+
+def propose_H(r_eff, cap=2):
+    """h_max = min(2, floor(0.5*r_eff)); H con direcciones básicas hasta h_max."""
+    hmax = min(max(1,int(np.floor(0.5*r_eff))), cap)
+    H=set()
+    for base in [(1,0),(0,1),(1,1),(-1,1)]:
+        for k in range(1,hmax+1):
+            H.add((base[0]*k, base[1]*k))
+    return sorted(H), hmax
+
+def codispersion(X, Y, h):
+    DX=roll_diff(X,*h); DY=roll_diff(Y,*h)
+    num=float((DX*DY).sum()); den=float(np.sqrt((DX*DX).sum()*(DY*DY).sum()))
+    return (num/den) if den>0 else np.nan
+
+# ---------- Taper (Tukey 2D) ----------
+def tukey_1d(N, k):
+    alpha = min(1.0, max(0.0, 2.0 * k / max(1, N - 1)))
+    n = np.arange(N, dtype=np.float32)
+    if alpha <= 0.0:
+        return np.ones(N, np.float32)
+    if alpha >= 1.0:
+        return 0.5 * (1 - np.cos(2*np.pi*n/(N-1))).astype(np.float32)
+    w = np.ones(N, np.float32)
+    edge = int(np.floor(alpha * (N - 1) / 2.0))
+    for i in range(edge):
+        w[i] = 0.5 * (1 + np.cos(np.pi * (2*i/(alpha*(N-1)) - 1)))
+        w[-(i+1)] = w[i]
+    return w
+
+def tukey2d(n1,n2,k):
+    return np.outer(tukey_1d(n1,k), tukey_1d(n2,k)).astype(np.float32)
+
+# ---------- Generación Rank-1 y ejecución ----------
+rng = np.random.default_rng(7)
+n = 256
+W = rng.standard_normal((n,n)).astype(np.float32)
+K = gaussian_kernel_2d(3.0, 3.0, 0.0)
+X_base = fftconv2(W, K)
+X_base = (X_base - X_base.mean())/X_base.std()
+
+pairs = {
+    "Rank-1 (Y = X)" : (X_base.copy(),  X_base.copy()),
+    "Rank-1 (Y = -X)": (X_base.copy(), -X_base.copy())
+}
+
+Wt = tukey2d(n,n,8)
+
+rows = []
+for name, (X, Y) in pairs.items():
+    # r_eff y H (pre)
+    dsX, gX = radial_variogram(X, 8)
+    dsY, gY = radial_variogram(Y, 8)
+    r_eff = min(effective_range(dsX,gX,0.95), effective_range(dsY,gY,0.95))
+    H, hmax = propose_H(r_eff, cap=2)
+
+    # ρ por H (pre)
+    rho_pre = {h: codispersion(X,Y,h) for h in H}
+
+    # Direccionales a k=1 para chequear identidades de γ
+    dirs = [(1,0),(0,1),(1,1),(-1,1)]
+    var_dir_X_pre = np.array([variogram_toroidal(X,h) for h in dirs])
+    var_dir_Y_pre = np.array([variogram_toroidal(Y,h) for h in dirs])
+    cross_dir_pre  = np.array([cross_variogram_toroidal(X,Y,h) for h in dirs])
+
+    # Taper
+    Xt, Yt = X*Wt, Y*Wt
+
+    # r_eff y H (post)
+    dsX_t, gX_t = radial_variogram(Xt, 8)
+    dsY_t, gY_t = radial_variogram(Yt, 8)
+    r_eff_t = min(effective_range(dsX_t,gX_t,0.95), effective_range(dsY_t,gY_t,0.95))
+    Ht, hmax_t = propose_H(r_eff_t, cap=2)
+    rho_post = {h: codispersion(Xt,Yt,h) for h in Ht}
+
+    # Chequeos automáticos
+    rho_target = 1.0 if "Y = X" in name else -1.0
+    err_pre  = max(abs(r - rho_target) for r in rho_pre.values())
+    err_post = max(abs(r - rho_target) for r in rho_post.values())
+    common_H = sorted(list(set(H).intersection(set(Ht))))
+    delta_taper = (max(abs(rho_pre[h] - rho_post[h]) for h in common_H) if common_H else np.nan)
+    sign = 1.0 if "Y = X" in name else -1.0
+    eq_XY_to_X = float(np.max(np.abs(cross_dir_pre - sign*var_dir_X_pre)))
+    eq_XY_to_Y = float(np.max(np.abs(cross_dir_pre - sign*var_dir_Y_pre)))
+    anis_X = float(var_dir_X_pre.max()/ (var_dir_X_pre.min()+1e-12))
+    anis_Y = float(var_dir_Y_pre.max()/ (var_dir_Y_pre.min()+1e-12))
+
+    rows.append({
+        "case": name,
+        "r_eff_pre": r_eff, "r_eff_post": r_eff_t,
+        "hmax_pre": hmax, "hmax_post": hmax_t,
+        "max|rho-±1|_pre": err_pre, "max|rho-±1|_post": err_post,
+        "max|Δrho|_taper": delta_taper,
+        "max|γ_XY-(±)γ_X| (k=1)": eq_XY_to_X,
+        "max|γ_XY-(±)γ_Y| (k=1)": eq_XY_to_Y,
+        "anis_ratio_X (k=1)": anis_X, "anis_ratio_Y (k=1)": anis_Y
+    })
+
+    # ---- Gráfica radial/cross (PRE) ----
+    dsC, gC = radial_cross_variogram(X, Y, 8)
+    plt.figure()
+    plt.plot(dsX, gX, label="gamma_X (pre)")
+    plt.plot(dsY, gY, label="gamma_Y (pre)")
+    plt.plot(dsC, gC, label="gamma_XY (pre)")
+    plt.xlabel("distance (px)"); plt.ylabel("variogram / cross")
+    plt.title(f"Radial variograms — {name} (PRE)")
+    plt.legend(); plt.tight_layout(); plt.show()
+
+    # ---- Tabla ρ por lag (pre y post) ----
+    print(f"\nRank-1 — rho per lag (pre/post) — {name}")
+    H_list = sorted(H)
+    same_H = (set(H) == set(Ht))
+    for h in H_list:
+        rp = rho_pre[h]
+        rpost = rho_post[h] if same_H else np.nan
+        # h es tupla; convertir a string antes de aplicar ancho/alineación
+        print(f"  h={str(h):>9s}  rho_pre={rp:+.6f}   rho_post={rpost:+.6f}")
+
+
+# ---- Resumen final ----
+summary_df = pd.DataFrame(rows)
+print("\nRank-1 unit tests — summary metrics\n", summary_df.to_string(index=False))
+
+__________________________________________________________________________________________________________
+
+Rank-1 — rho per lag (pre/post) — Rank-1 (Y = X)
+  h=  (-2, 2)  rho_pre=+1.000000   rho_post=+1.000000
+  h=  (-1, 1)  rho_pre=+1.000000   rho_post=+1.000000
+  h=   (0, 1)  rho_pre=+1.000000   rho_post=+1.000000
+  h=   (0, 2)  rho_pre=+1.000000   rho_post=+1.000000
+  h=   (1, 0)  rho_pre=+1.000000   rho_post=+1.000000
+  h=   (1, 1)  rho_pre=+1.000000   rho_post=+1.000000
+  h=   (2, 0)  rho_pre=+1.000000   rho_post=+1.000000
+  h=   (2, 2)  rho_pre=+1.000000   rho_post=+1.000000
+
+__________________________________________________________________________________________________________
+
+Rank-1 — rho per lag (pre/post) — Rank-1 (Y = -X)
+  h=  (-2, 2)  rho_pre=-1.000000   rho_post=-1.000000
+  h=  (-1, 1)  rho_pre=-1.000000   rho_post=-1.000000
+  h=   (0, 1)  rho_pre=-1.000000   rho_post=-1.000000
+  h=   (0, 2)  rho_pre=-1.000000   rho_post=-1.000000
+  h=   (1, 0)  rho_pre=-1.000000   rho_post=-1.000000
+  h=   (1, 1)  rho_pre=-1.000000   rho_post=-1.000000
+  h=   (2, 0)  rho_pre=-1.000000   rho_post=-1.000000
+  h=   (2, 2)  rho_pre=-1.000000   rho_post=-1.000000
+
+Rank-1 unit tests — summary metrics
+            case  r_eff_pre  r_eff_post  hmax_pre  hmax_post  max|rho-±1|_pre  max|rho-±1|_post  max|Δrho|_taper  max|γ_XY-(±)γ_X| (k=1)  max|γ_XY-(±)γ_Y| (k=1)  anis_ratio_X (k=1)  anis_ratio_Y (k=1)
+ Rank-1 (Y = X)   7.615773    7.615773         2          2              0.0               0.0              0.0                     0.0                     0.0             2.00937             2.00937
+Rank-1 (Y = -X)   7.615773    7.615773         2          2              0.0               0.0              0.0                     0.0                     0.0             2.00937             2.00937

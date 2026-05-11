@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/codispersion_real_case/__init__.py
+src/codispersion_real_case/block_selection.py
+src/codispersion_real_case/bootstrap.py
+src/codispersion_real_case/codispersion.py
+src/codispersion_real_case/diagnostics.py
+src/codispersion_real_case/pipelines.py
+src/codispersion_real_case/plotting.py
+src/codispersion_real_case/preprocessing.py
+src/codispersion_real_case/synthetic.py
+src/codispersion_real_case.egg-info/PKG-INFO
+src/codispersion_real_case.egg-info/SOURCES.txt
+src/codispersion_real_case.egg-info/dependency_links.txt
+src/codispersion_real_case.egg-info/requires.txt
+src/codispersion_real_case.egg-info/top_level.txt
+tests/test_smoke.py

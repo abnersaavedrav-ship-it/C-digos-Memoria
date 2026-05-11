@@ -1,0 +1,598 @@
+PRIMER ESTUDIO DE SIMULACIÓN
+__________________________________________________________________________________________________________
+
+
+# ================================
+# BLOQUE 1 — UTILIDADES BASE
+# ================================
+# Requisitos: numpy >= 1.22
+import numpy as np
+from typing import Tuple, List, Dict
+
+# -------------------------------
+# 1) Lags H
+# -------------------------------
+def build_H(hmax: int = 2) -> List[Tuple[int,int]]:
+    """
+    Conjunto direccional corto:
+    H = { k*(1,0), k*(0,1), k*(1,1), k*(-1,1) : k=1..hmax }.
+    """
+    dirs = [(1,0),(0,1),(1,1),(-1,1)]
+    H = []
+    for k in range(1, hmax+1):
+        for d in dirs:
+            H.append((k*d[0], k*d[1]))
+    return H
+
+# -------------------------------
+# 2) Ventana Tukey 2D (8 px)
+# -------------------------------
+def tukey_1d(n: int, alpha: float = 0.5) -> np.ndarray:
+    """
+    Ventana de Tukey 1D [0..n-1].
+    alpha=0.5 ~ Hann en bordes/flat en centro.
+    """
+    if n < 2: 
+        return np.ones(n)
+    w = np.ones(n, dtype=float)
+    edge = int(alpha*(n-1)/2.0)
+    if edge > 0:
+        t = np.arange(edge) / edge
+        taper = 0.5*(1 - np.cos(np.pi*t))
+        w[:edge] = taper
+        w[-edge:] = taper[::-1]
+    return w
+
+def tukey2d(n1: int, n2: int, k_px: int = 8) -> np.ndarray:
+    """
+    Ventana Tukey 2D separable ajustada por cantidad de píxeles de rampa (k_px).
+    """
+    # Convertimos k_px a alpha por eje
+    a1 = min(1.0, max(0.0, 2*k_px/max(n1-1,1)))
+    a2 = min(1.0, max(0.0, 2*k_px/max(n2-1,1)))
+    w1 = tukey_1d(n1, alpha=a1)
+    w2 = tukey_1d(n2, alpha=a2)
+    W = np.outer(w1, w2)
+    return W
+
+# -------------------------------
+# 3) Incrementos toroidales Δ_h
+# -------------------------------
+def delta_h_toroidal(Z: np.ndarray, h: Tuple[int,int]) -> np.ndarray:
+    """
+    Incremento Δ_h Z(s) = Z(s ⊕ h) - Z(s) con suma modular (envoltura toroidal).
+    Implementado con np.roll (desplazamiento circular).
+    """
+    h1, h2 = h
+    Z_shift = np.roll(np.roll(Z, shift=h1, axis=0), shift=h2, axis=1)
+    return Z_shift - Z
+
+# -------------------------------
+# 4) Estimador de codispersión ρ̂(h)
+#    (forma promedio de contribuciones)
+# -------------------------------
+def codisp_rho_hat(
+    X: np.ndarray,
+    Y: np.ndarray,
+    h: Tuple[int,int],
+    return_contrib: bool = False
+) -> Tuple[float, np.ndarray]:
+    """
+    ρ̂(h) = (1/m) * sum_s  s_s(h)
+    donde s_s(h) = Δ_h X(s) Δ_h Y(s) / sqrt(Ā(h) B̄(h))
+    con Ā(h) = (1/m) sum_s (Δ_h X)^2, B̄(h) análogo.
+    Usa toroidal por defecto (N(h)=D).
+    """
+    dX = delta_h_toroidal(X, h)
+    dY = delta_h_toroidal(Y, h)
+    Abar = np.mean(dX**2)
+    Bbar = np.mean(dY**2)
+    if Abar <= 0 or Bbar <= 0:
+        rho = np.nan
+        S = np.full_like(dX, np.nan, dtype=float)
+        return (rho, S) if return_contrib else (rho, None)
+    S = (dX * dY) / np.sqrt(Abar * Bbar)
+    rho = np.mean(S)
+    return (rho, S) if return_contrib else (rho, None)
+
+# -------------------------------
+# 5) CBB pareado (mosaico con wrap)
+# -------------------------------
+def cbb_sample_pair(
+    X: np.ndarray,
+    Y: np.ndarray,
+    b: int,
+    rng: np.random.Generator
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Circular Block Bootstrap (CBB) 2D pareado:
+    - Se arma un mosaico de celdas b×b.
+    - Para cada celda se toma un bloque (con wrap) desde un origen aleatorio (i,j),
+      usando los MISMOS orígenes para X e Y.
+    - Se recorta a tamaño exacto (n1×n2).
+    """
+    n1, n2 = X.shape
+    assert X.shape == Y.shape, "X e Y deben tener el mismo tamaño."
+    assert b >= 1 and isinstance(b, int), "b debe ser entero positivo."
+
+    g1 = (n1 + b - 1) // b  # # de celdas en eje 1
+    g2 = (n2 + b - 1) // b  # # de celdas en eje 2
+
+    out1 = g1 * b
+    out2 = g2 * b
+    Xo = np.empty((out1, out2), dtype=float)
+    Yo = np.empty((out1, out2), dtype=float)
+
+    for u in range(g1):
+        for v in range(g2):
+            i0 = rng.integers(0, n1)
+            j0 = rng.integers(0, n2)
+            # Extraer bloque b×b con wrap vía roll + slicing
+            Xi = np.roll(np.roll(X, i0, axis=0), j0, axis=1)[:b, :b]
+            Yi = np.roll(np.roll(Y, i0, axis=0), j0, axis=1)[:b, :b]
+            r0 = u*b
+            c0 = v*b
+            Xo[r0:r0+b, c0:c0+b] = Xi
+            Yo[r0:r0+b, c0:c0+b] = Yi
+
+    # Recorte al tamaño exacto
+    return Xo[:n1, :n2], Yo[:n1, :n2]
+
+# -------------------------------
+# 6) Bootstrap de codispersión por lag
+# -------------------------------
+def boot_codispersion_CBB(
+    X: np.ndarray,
+    Y: np.ndarray,
+    H: List[Tuple[int,int]],
+    b: int,
+    B: int = 800,
+    seed: int = 12345,
+    return_samples: bool = False
+) -> Dict[str, Dict]:
+    """
+    Ejecuta CBB pareado y calcula, por cada h∈H:
+      - muestras ρ* (si return_samples=True)
+      - varianza bootstrap Var*(ρ̂(h))
+      - IC percentil 95% (lo, hi)
+    Devuelve un diccionario por lag.
+    """
+    rng = np.random.default_rng(seed)
+    nH = len(H)
+    rho_star = {h: np.empty(B, dtype=float) for h in H}
+
+    for k in range(B):
+        Xs, Ys = cbb_sample_pair(X, Y, b, rng)
+        for h in H:
+            rho_k, _ = codisp_rho_hat(Xs, Ys, h, return_contrib=False)
+            rho_star[h][k] = rho_k
+
+    results = {}
+    for h in H:
+        arr = rho_star[h]
+        var_boot = float(np.var(arr, ddof=1))
+        lo, hi = np.percentile(arr, [2.5, 97.5])
+        entry = {"var_boot": var_boot, "ci_lo": float(lo), "ci_hi": float(hi)}
+        if return_samples:
+            entry["samples"] = arr.copy()
+        results[str(h)] = entry
+    return results
+
+# -------------------------------
+# 7) Utilidades varias
+# -------------------------------
+def standardize_pair(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estandariza por canal (media 0, var 1).
+    """
+    Xs = (X - np.mean(X)) / (np.std(X) + 1e-12)
+    Ys = (Y - np.mean(Y)) / (np.std(Y) + 1e-12)
+    return Xs, Ys
+
+def apply_tukey8(X: np.ndarray, Y: np.ndarray, k_px: int = 8) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Aplica la misma ventana Tukey 2D (k_px por borde) a X e Y.
+    """
+    n1, n2 = X.shape
+    W = tukey2d(n1, n2, k_px=k_px)
+    return X*W, Y*W
+
+__________________________________________________________________________________________________________
+
+# ============================================
+# BLOQUE 2 — SIMULACIÓN DE CAMPOS Y EXPERIMENTO MÍNIMO
+# ============================================
+# Requisitos: solo numpy (sin internet). Ejecuta antes el BLOQUE 1.
+import numpy as np
+from typing import Tuple, List, Dict
+
+# --------------------------------------------
+# 1) Generador de GRF suave (Gaussiano) por filtro espectral anisotrópico
+# --------------------------------------------
+def _freq_grids(n1: int, n2: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Mallas de frecuencias normalizadas (radianes/pixel) para FFT 2D.
+    """
+    # Frecuencias 1D en convención FFT (0,1,2,...,N/2,-N/2+1,...,-1)
+    k1 = np.fft.fftfreq(n1) * 2*np.pi
+    k2 = np.fft.fftfreq(n2) * 2*np.pi
+    K2, K1 = np.meshgrid(k2, k1)  # (n1,n2) con ejes (fila,col)
+    return K1, K2
+
+def _rotate(kx: np.ndarray, ky: np.ndarray, theta_rad: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rotación (kx,ky) -> (k'x,k'y) por ángulo theta (radianes).
+    """
+    ct, st = np.cos(theta_rad), np.sin(theta_rad)
+    kxp =  ct*kx + st*ky
+    kyp = -st*kx + ct*ky
+    return kxp, kyp
+
+def grf_gaussian_spectral(
+    n1: int,
+    n2: int,
+    sig_x: float,
+    sig_y: float,
+    theta_deg: float = 0.0,
+    rng: np.random.Generator = None
+) -> np.ndarray:
+    """
+    GRF suave obtenido aplicando un filtro Gaussiano anisotrópico en el dominio de Fourier.
+    - sig_x, sig_y: controlan el 'rango' (cuanto mayores, más suave).
+    - theta_deg: rotación del eje principal del filtro (anisotropía).
+    Retorna un array real de tamaño (n1,n2).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    K1, K2 = _freq_grids(n1, n2)
+    # Rotar el sistema de frecuencias para aplicar elíptica orientada:
+    th = np.deg2rad(theta_deg)
+    K1p, K2p = _rotate(K1, K2, th)
+    # Filtro Gaussiano en frecuencia: exp( -0.5 * ( (sig_x*kx')^2 + (sig_y*ky')^2 ) )
+    # (equivalente a convolución Gaussiana en el espacio)
+    F = np.exp(-0.5 * ((sig_x*K1p)**2 + (sig_y*K2p)**2))
+    # Ruido blanco complejo con simetría hermítica para obtener campo real:
+    W = rng.normal(size=(n1, n2)) + 1j*rng.normal(size=(n1, n2))
+    # Aplicar filtro (raíz no necesaria al ser filtro de suavizado lineal):
+    Z_hat = F * W
+    Z = np.fft.ifft2(Z_hat).real
+    return Z
+
+def standardize(Z: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Estandariza (media 0, var 1)."""
+    return (Z - Z.mean()) / (Z.std() + eps)
+
+# --------------------------------------------
+# 2) Simulación de un PAR (X,Y) con control de correlación base
+#    Tres configuraciones: isotrópico, anisotrópico o 'rangos distintos'
+# --------------------------------------------
+def simulate_pair_basic(
+    n1: int,
+    n2: int,
+    rho0: float = 0.5,
+    range_pix: int = 7,
+    mode: str = "iso",
+    angle_deg: float = 45.0,
+    rng: np.random.Generator = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Genera (X,Y) ~ campos suaves correlacionados:
+    - mode='iso'        : ambos isotrópicos
+    - mode='aniso'      : Y anisotrópico (razón 2:1, rotación angle_deg)
+    - mode='diff_range' : mismos ejes pero suavizados con distintos 'rangos'
+    La correlación objetivo rho0 se induce con Y = c*X + eta*Epsilon (independiente).
+    Nota: c=rho0 y eta=sqrt(1 - c^2) logran Corr(X,Y)≈rho0 (aprox. tras estandarizar).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Convertimos range_pix en parámetros de suavizado espectral (heurística):
+    # (valores mayores => más liso; escala suave ~ range_pix/2)
+    sig_base = max(1.0, range_pix / 2.0)
+
+    # X: siempre isotrópico
+    X0 = grf_gaussian_spectral(n1, n2, sig_x=sig_base, sig_y=sig_base, theta_deg=0.0, rng=rng)
+    X0 = standardize(X0)
+
+    # Ruido suave (para mezclar en Y)
+    Eps = grf_gaussian_spectral(n1, n2, sig_x=sig_base, sig_y=sig_base, theta_deg=0.0, rng=rng)
+    Eps = standardize(Eps)
+
+    # Diseños para Y
+    if mode == "iso":
+        Y_base = X0.copy()  # misma textura de fondo
+    elif mode == "aniso":
+        # Y con elipse 2:1 rotada
+        Y_base = grf_gaussian_spectral(n1, n2, sig_x=2*sig_base, sig_y=1*sig_base,
+                                       theta_deg=angle_deg, rng=rng)
+        Y_base = standardize(Y_base)
+    elif mode == "diff_range":
+        # Y con rango distinto (más liso)
+        Y_base = grf_gaussian_spectral(n1, n2, sig_x=1.5*sig_base, sig_y=1.5*sig_base,
+                                       theta_deg=0.0, rng=rng)
+        Y_base = standardize(Y_base)
+    else:
+        raise ValueError("mode debe ser 'iso', 'aniso' o 'diff_range'.")
+
+    # Mezcla para alcanzar correlación aproximada
+    c = float(np.clip(rho0, -0.999, 0.999))
+    eta = float(np.sqrt(max(0.0, 1.0 - c**2)))
+    Y0 = c * X0 + eta * Eps   # correlación X–Y ≈ c (aprox.)
+
+    # Reforzar textura base de Y (si mode != 'iso'), combinando con Y_base
+    if mode != "iso":
+        # Mezcla suave: 70% (cX + ruido) + 30% textura propia de Y
+        Y0 = 0.7 * standardize(Y0) + 0.3 * Y_base
+
+    # Estandarizar canales finales
+    X = standardize(X0)
+    Y = standardize(Y0)
+    return X, Y
+
+# --------------------------------------------
+# 3) Experimento mínimo reproducible
+#    (un escenario, un H, un b; calcula ρ̂(h) y corre bootstrap)
+# --------------------------------------------
+def run_min_experiment(
+    n1: int = 256,
+    n2: int = 256,
+    rho0: float = 0.8,
+    range_pix: int = 7,
+    mode: str = "aniso",        # 'iso' | 'aniso' | 'diff_range'
+    angle_deg: float = 45.0,
+    hmax: int = 2,
+    b: int = 57,
+    B: int = 800,               # puedes subir a 800+ en tu corrida final
+    seed: int = 2025
+) -> Dict[str, Dict]:
+    """
+    - Genera (X,Y), aplica estandarización y Tukey 8 px,
+    - Calcula ρ̂(h) para h∈H,
+    - Ejecuta CBB pareado y entrega Var* e IC percentil 95% por lag.
+    """
+    rng = np.random.default_rng(seed)
+    # 1) Simulación
+    X, Y = simulate_pair_basic(n1, n2, rho0, range_pix, mode, angle_deg, rng=rng)
+
+    # 2) Preprocesamiento (igual en ambos canales)
+    X, Y = apply_tukey8(X, Y, k_px=8)   # del BLOQUE 1
+    X, Y = standardize_pair(X, Y)       # del BLOQUE 1
+
+    # 3) Lags y ρ̂(h)
+    H = build_H(hmax=hmax)              # del BLOQUE 1
+    rho_hat = {}
+    for h in H:
+        r, _ = codisp_rho_hat(X, Y, h, return_contrib=False)  # del BLOQUE 1
+        rho_hat[str(h)] = float(r)
+
+    # 4) Bootstrap CBB pareado
+    boot_res = boot_codispersion_CBB(X, Y, H, b=b, B=B, seed=seed, return_samples=False)  # BLOQUE 1
+
+    # Empaquetar salida
+    out = {"rho_hat": rho_hat, "boot": boot_res, "H": [tuple(h) for h in H],
+           "params": {"rho0": rho0, "range_pix": range_pix, "mode": mode,
+                      "angle_deg": angle_deg, "b": b, "B": B, "n": (n1, n2)}}
+    return out
+
+# --------------------------------------------
+# 4) DEMO: ejecutar una corrida mínima al importar/ejecutar
+# --------------------------------------------
+if __name__ == "__main__":
+    # Configuración rápida (puedes modificar y volver a correr)
+    result = run_min_experiment(
+        n1=256, n2=256,
+        rho0=0.8, range_pix=7,
+        mode="aniso", angle_deg=45.0,
+        hmax=2, b=57, B=200,  # B=200 para prueba rápida
+        seed=2025
+    )
+    # Mostrar resumen breve en consola
+    print("Parámetros:", result["params"])
+    print("Lags H:", result["H"])
+    print("ρ̂(h) por lag:")
+    for h, r in result["rho_hat"].items():
+        print(f"  h={h:>8s}  rho_hat={r: .6f}")
+    print("\nBootstrap (Var*, IC 95%):")
+    for h, info in result["boot"].items():
+        print(f"  h={h:>8s}  var*={info['var_boot']:.6e}  IC=({info['ci_lo']:.6f}, {info['ci_hi']:.6f})")
+
+__________________________________________________________________________________________________________
+
+# ============================================
+# BLOQUE 2 — SIMULACIÓN DE CAMPOS Y EXPERIMENTO MÍNIMO
+# ============================================
+# Requisitos: solo numpy (sin internet). Ejecuta antes el BLOQUE 1.
+import numpy as np
+from typing import Tuple, List, Dict
+
+# --------------------------------------------
+# 1) Generador de GRF suave (Gaussiano) por filtro espectral anisotrópico
+# --------------------------------------------
+def _freq_grids(n1: int, n2: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Mallas de frecuencias normalizadas (radianes/pixel) para FFT 2D.
+    """
+    # Frecuencias 1D en convención FFT (0,1,2,...,N/2,-N/2+1,...,-1)
+    k1 = np.fft.fftfreq(n1) * 2*np.pi
+    k2 = np.fft.fftfreq(n2) * 2*np.pi
+    K2, K1 = np.meshgrid(k2, k1)  # (n1,n2) con ejes (fila,col)
+    return K1, K2
+
+def _rotate(kx: np.ndarray, ky: np.ndarray, theta_rad: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rotación (kx,ky) -> (k'x,k'y) por ángulo theta (radianes).
+    """
+    ct, st = np.cos(theta_rad), np.sin(theta_rad)
+    kxp =  ct*kx + st*ky
+    kyp = -st*kx + ct*ky
+    return kxp, kyp
+
+def grf_gaussian_spectral(
+    n1: int,
+    n2: int,
+    sig_x: float,
+    sig_y: float,
+    theta_deg: float = 0.0,
+    rng: np.random.Generator = None
+) -> np.ndarray:
+    """
+    GRF suave obtenido aplicando un filtro Gaussiano anisotrópico en el dominio de Fourier.
+    - sig_x, sig_y: controlan el 'rango' (cuanto mayores, más suave).
+    - theta_deg: rotación del eje principal del filtro (anisotropía).
+    Retorna un array real de tamaño (n1,n2).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    K1, K2 = _freq_grids(n1, n2)
+    # Rotar el sistema de frecuencias para aplicar elíptica orientada:
+    th = np.deg2rad(theta_deg)
+    K1p, K2p = _rotate(K1, K2, th)
+    # Filtro Gaussiano en frecuencia: exp( -0.5 * ( (sig_x*kx')^2 + (sig_y*ky')^2 ) )
+    # (equivalente a convolución Gaussiana en el espacio)
+    F = np.exp(-0.5 * ((sig_x*K1p)**2 + (sig_y*K2p)**2))
+    # Ruido blanco complejo con simetría hermítica para obtener campo real:
+    W = rng.normal(size=(n1, n2)) + 1j*rng.normal(size=(n1, n2))
+    # Aplicar filtro (raíz no necesaria al ser filtro de suavizado lineal):
+    Z_hat = F * W
+    Z = np.fft.ifft2(Z_hat).real
+    return Z
+
+def standardize(Z: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Estandariza (media 0, var 1)."""
+    return (Z - Z.mean()) / (Z.std() + eps)
+
+# --------------------------------------------
+# 2) Simulación de un PAR (X,Y) con control de correlación base
+#    Tres configuraciones: isotrópico, anisotrópico o 'rangos distintos'
+# --------------------------------------------
+def simulate_pair_basic(
+    n1: int,
+    n2: int,
+    rho0: float = 0.5,
+    range_pix: int = 7,
+    mode: str = "iso",
+    angle_deg: float = 45.0,
+    rng: np.random.Generator = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Genera (X,Y) ~ campos suaves correlacionados:
+    - mode='iso'        : ambos isotrópicos
+    - mode='aniso'      : Y anisotrópico (razón 2:1, rotación angle_deg)
+    - mode='diff_range' : mismos ejes pero suavizados con distintos 'rangos'
+    La correlación objetivo rho0 se induce con Y = c*X + eta*Epsilon (independiente).
+    Nota: c=rho0 y eta=sqrt(1 - c^2) logran Corr(X,Y)≈rho0 (aprox. tras estandarizar).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Convertimos range_pix en parámetros de suavizado espectral (heurística):
+    # (valores mayores => más liso; escala suave ~ range_pix/2)
+    sig_base = max(1.0, range_pix / 2.0)
+
+    # X: siempre isotrópico
+    X0 = grf_gaussian_spectral(n1, n2, sig_x=sig_base, sig_y=sig_base, theta_deg=0.0, rng=rng)
+    X0 = standardize(X0)
+
+    # Ruido suave (para mezclar en Y)
+    Eps = grf_gaussian_spectral(n1, n2, sig_x=sig_base, sig_y=sig_base, theta_deg=0.0, rng=rng)
+    Eps = standardize(Eps)
+
+    # Diseños para Y
+    if mode == "iso":
+        Y_base = X0.copy()  # misma textura de fondo
+    elif mode == "aniso":
+        # Y con elipse 2:1 rotada
+        Y_base = grf_gaussian_spectral(n1, n2, sig_x=2*sig_base, sig_y=1*sig_base,
+                                       theta_deg=angle_deg, rng=rng)
+        Y_base = standardize(Y_base)
+    elif mode == "diff_range":
+        # Y con rango distinto (más liso)
+        Y_base = grf_gaussian_spectral(n1, n2, sig_x=1.5*sig_base, sig_y=1.5*sig_base,
+                                       theta_deg=0.0, rng=rng)
+        Y_base = standardize(Y_base)
+    else:
+        raise ValueError("mode debe ser 'iso', 'aniso' o 'diff_range'.")
+
+    # Mezcla para alcanzar correlación aproximada
+    c = float(np.clip(rho0, -0.999, 0.999))
+    eta = float(np.sqrt(max(0.0, 1.0 - c**2)))
+    Y0 = c * X0 + eta * Eps   # correlación X–Y ≈ c (aprox.)
+
+    # Reforzar textura base de Y (si mode != 'iso'), combinando con Y_base
+    if mode != "iso":
+        # Mezcla suave: 70% (cX + ruido) + 30% textura propia de Y
+        Y0 = 0.7 * standardize(Y0) + 0.3 * Y_base
+
+    # Estandarizar canales finales
+    X = standardize(X0)
+    Y = standardize(Y0)
+    return X, Y
+
+# --------------------------------------------
+# 3) Experimento mínimo reproducible
+#    (un escenario, un H, un b; calcula ρ̂(h) y corre bootstrap)
+# --------------------------------------------
+def run_min_experiment(
+    n1: int = 256,
+    n2: int = 256,
+    rho0: float = 0.8,
+    range_pix: int = 7,
+    mode: str = "aniso",        # 'iso' | 'aniso' | 'diff_range'
+    angle_deg: float = 45.0,
+    hmax: int = 2,
+    b: int = 57,
+    B: int = 800,               # puedes subir a 800+ en tu corrida final
+    seed: int = 2025
+) -> Dict[str, Dict]:
+    """
+    - Genera (X,Y), aplica estandarización y Tukey 8 px,
+    - Calcula ρ̂(h) para h∈H,
+    - Ejecuta CBB pareado y entrega Var* e IC percentil 95% por lag.
+    """
+    rng = np.random.default_rng(seed)
+    # 1) Simulación
+    X, Y = simulate_pair_basic(n1, n2, rho0, range_pix, mode, angle_deg, rng=rng)
+
+    # 2) Preprocesamiento (igual en ambos canales)
+    X, Y = apply_tukey8(X, Y, k_px=8)   # del BLOQUE 1
+    X, Y = standardize_pair(X, Y)       # del BLOQUE 1
+
+    # 3) Lags y ρ̂(h)
+    H = build_H(hmax=hmax)              # del BLOQUE 1
+    rho_hat = {}
+    for h in H:
+        r, _ = codisp_rho_hat(X, Y, h, return_contrib=False)  # del BLOQUE 1
+        rho_hat[str(h)] = float(r)
+
+    # 4) Bootstrap CBB pareado
+    boot_res = boot_codispersion_CBB(X, Y, H, b=b, B=B, seed=seed, return_samples=False)  # BLOQUE 1
+
+    # Empaquetar salida
+    out = {"rho_hat": rho_hat, "boot": boot_res, "H": [tuple(h) for h in H],
+           "params": {"rho0": rho0, "range_pix": range_pix, "mode": mode,
+                      "angle_deg": angle_deg, "b": b, "B": B, "n": (n1, n2)}}
+    return out
+
+# --------------------------------------------
+# 4) DEMO: ejecutar una corrida mínima al importar/ejecutar
+# --------------------------------------------
+if __name__ == "__main__":
+    # Configuración rápida (puedes modificar y volver a correr)
+    result = run_min_experiment(
+        n1=256, n2=256,
+        rho0=0.8, range_pix=7,
+        mode="aniso", angle_deg=45.0,
+        hmax=2, b=57, B=200,  # B=200 para prueba rápida
+        seed=2025
+    )
+    # Mostrar resumen breve en consola
+    print("Parámetros:", result["params"])
+    print("Lags H:", result["H"])
+    print("ρ̂(h) por lag:")
+    for h, r in result["rho_hat"].items():
+        print(f"  h={h:>8s}  rho_hat={r: .6f}")
+    print("\nBootstrap (Var*, IC 95%):")
+    for h, info in result["boot"].items():
+        print(f"  h={h:>8s}  var*={info['var_boot']:.6e}  IC=({info['ci_lo']:.6f}, {info['ci_hi']:.6f})")
+
+

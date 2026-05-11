@@ -1,0 +1,684 @@
+CUARTO ESTUDIO DE SIMULACIÓN
+______________________________________________________________________________________________________________
+
+SEGUNDO ESTUDIO DE SIMULACIÓN
+______________________________________________________________________________________________________________
+# ================================
+# BLOQUE 1 — UTILIDADES BASE
+# ================================
+# Requisitos: numpy >= 1.22
+import numpy as np
+from typing import Tuple, List, Dict
+
+# -------------------------------
+# 1) Lags H
+# -------------------------------
+def build_H(hmax: int = 2) -> List[Tuple[int,int]]:
+    """
+    Conjunto direccional corto:
+    H = { k*(1,0), k*(0,1), k*(1,1), k*(-1,1) : k=1..hmax }.
+    """
+    dirs = [(1,0),(0,1),(1,1),(-1,1)]
+    H = []
+    for k in range(1, hmax+1):
+        for d in dirs:
+            H.append((k*d[0], k*d[1]))
+    return H
+
+# -------------------------------
+# 2) Ventana Tukey 2D (8 px)
+# -------------------------------
+def tukey_1d(n: int, alpha: float = 0.5) -> np.ndarray:
+    """
+    Ventana de Tukey 1D [0..n-1].
+    alpha=0.5 ~ Hann en bordes/flat en centro.
+    """
+    if n < 2: 
+        return np.ones(n)
+    w = np.ones(n, dtype=float)
+    edge = int(alpha*(n-1)/2.0)
+    if edge > 0:
+        t = np.arange(edge) / edge
+        taper = 0.5*(1 - np.cos(np.pi*t))
+        w[:edge] = taper
+        w[-edge:] = taper[::-1]
+    return w
+
+def tukey2d(n1: int, n2: int, k_px: int = 8) -> np.ndarray:
+    """
+    Ventana Tukey 2D separable ajustada por cantidad de píxeles de rampa (k_px).
+    """
+    # Convertimos k_px a alpha por eje
+    a1 = min(1.0, max(0.0, 2*k_px/max(n1-1,1)))
+    a2 = min(1.0, max(0.0, 2*k_px/max(n2-1,1)))
+    w1 = tukey_1d(n1, alpha=a1)
+    w2 = tukey_1d(n2, alpha=a2)
+    W = np.outer(w1, w2)
+    return W
+
+# -------------------------------
+# 3) Incrementos toroidales Δ_h
+# -------------------------------
+def delta_h_toroidal(Z: np.ndarray, h: Tuple[int,int]) -> np.ndarray:
+    """
+    Incremento Δ_h Z(s) = Z(s ⊕ h) - Z(s) con suma modular (envoltura toroidal).
+    Implementado con np.roll (desplazamiento circular).
+    """
+    h1, h2 = h
+    Z_shift = np.roll(np.roll(Z, shift=h1, axis=0), shift=h2, axis=1)
+    return Z_shift - Z
+
+# -------------------------------
+# 4) Estimador de codispersión ρ̂(h)
+#    (forma promedio de contribuciones)
+# -------------------------------
+def codisp_rho_hat(
+    X: np.ndarray,
+    Y: np.ndarray,
+    h: Tuple[int,int],
+    return_contrib: bool = False
+) -> Tuple[float, np.ndarray]:
+    """
+    ρ̂(h) = (1/m) * sum_s  s_s(h)
+    donde s_s(h) = Δ_h X(s) Δ_h Y(s) / sqrt(Ā(h) B̄(h))
+    con Ā(h) = (1/m) sum_s (Δ_h X)^2, B̄(h) análogo.
+    Usa toroidal por defecto (N(h)=D).
+    """
+    dX = delta_h_toroidal(X, h)
+    dY = delta_h_toroidal(Y, h)
+    Abar = np.mean(dX**2)
+    Bbar = np.mean(dY**2)
+    if Abar <= 0 or Bbar <= 0:
+        rho = np.nan
+        S = np.full_like(dX, np.nan, dtype=float)
+        return (rho, S) if return_contrib else (rho, None)
+    S = (dX * dY) / np.sqrt(Abar * Bbar)
+    rho = np.mean(S)
+    return (rho, S) if return_contrib else (rho, None)
+
+# -------------------------------
+# 5) CBB pareado (mosaico con wrap)
+# -------------------------------
+def cbb_sample_pair(
+    X: np.ndarray,
+    Y: np.ndarray,
+    b: int,
+    rng: np.random.Generator
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Circular Block Bootstrap (CBB) 2D pareado:
+    - Se arma un mosaico de celdas b×b.
+    - Para cada celda se toma un bloque (con wrap) desde un origen aleatorio (i,j),
+      usando los MISMOS orígenes para X e Y.
+    - Se recorta a tamaño exacto (n1×n2).
+    """
+    n1, n2 = X.shape
+    assert X.shape == Y.shape, "X e Y deben tener el mismo tamaño."
+    assert b >= 1 and isinstance(b, int), "b debe ser entero positivo."
+
+    g1 = (n1 + b - 1) // b  # # de celdas en eje 1
+    g2 = (n2 + b - 1) // b  # # de celdas en eje 2
+
+    out1 = g1 * b
+    out2 = g2 * b
+    Xo = np.empty((out1, out2), dtype=float)
+    Yo = np.empty((out1, out2), dtype=float)
+
+    for u in range(g1):
+        for v in range(g2):
+            i0 = rng.integers(0, n1)
+            j0 = rng.integers(0, n2)
+            # Extraer bloque b×b con wrap vía roll + slicing
+            Xi = np.roll(np.roll(X, i0, axis=0), j0, axis=1)[:b, :b]
+            Yi = np.roll(np.roll(Y, i0, axis=0), j0, axis=1)[:b, :b]
+            r0 = u*b
+            c0 = v*b
+            Xo[r0:r0+b, c0:c0+b] = Xi
+            Yo[r0:r0+b, c0:c0+b] = Yi
+
+    # Recorte al tamaño exacto
+    return Xo[:n1, :n2], Yo[:n1, :n2]
+
+# -------------------------------
+# 6) Bootstrap de codispersión por lag
+# -------------------------------
+def boot_codispersion_CBB(
+    X: np.ndarray,
+    Y: np.ndarray,
+    H: List[Tuple[int,int]],
+    b: int,
+    B: int = 800,
+    seed: int = 12345,
+    return_samples: bool = False
+) -> Dict[str, Dict]:
+    """
+    Ejecuta CBB pareado y calcula, por cada h∈H:
+      - muestras ρ* (si return_samples=True)
+      - varianza bootstrap Var*(ρ̂(h))
+      - IC percentil 95% (lo, hi)
+    Devuelve un diccionario por lag.
+    """
+    rng = np.random.default_rng(seed)
+    nH = len(H)
+    rho_star = {h: np.empty(B, dtype=float) for h in H}
+
+    for k in range(B):
+        Xs, Ys = cbb_sample_pair(X, Y, b, rng)
+        for h in H:
+            rho_k, _ = codisp_rho_hat(Xs, Ys, h, return_contrib=False)
+            rho_star[h][k] = rho_k
+
+    results = {}
+    for h in H:
+        arr = rho_star[h]
+        var_boot = float(np.var(arr, ddof=1))
+        lo, hi = np.percentile(arr, [2.5, 97.5])
+        entry = {"var_boot": var_boot, "ci_lo": float(lo), "ci_hi": float(hi)}
+        if return_samples:
+            entry["samples"] = arr.copy()
+        results[str(h)] = entry
+    return results
+
+# -------------------------------
+# 7) Utilidades varias
+# -------------------------------
+def standardize_pair(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estandariza por canal (media 0, var 1).
+    """
+    Xs = (X - np.mean(X)) / (np.std(X) + 1e-12)
+    Ys = (Y - np.mean(Y)) / (np.std(Y) + 1e-12)
+    return Xs, Ys
+
+def apply_tukey8(X: np.ndarray, Y: np.ndarray, k_px: int = 8) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Aplica la misma ventana Tukey 2D (k_px por borde) a X e Y.
+    """
+    n1, n2 = X.shape
+    W = tukey2d(n1, n2, k_px=k_px)
+    return X*W, Y*W
+
+# ============================================
+# BLOQUE 2.5 — SIMULACIÓN MATÉRN + CROSS-COVARIANZA (LMC)
+# ============================================
+# Requisitos previos: haber ejecutado el BLOQUE 1 (utilidades base).
+# Este bloque genera (X,Y) como combinación lineal de GRFs Matérn (modelo LMC):
+#   G  ~ Matérn(ν, κ, anisotropía)   (campo "común")
+#   H  ~ Matérn(ν, κ, anisotropía)   (campo independiente)
+#   X  = G
+#   Y  = c * G + sqrt(1 - c^2) * H
+# => C_XX(h) = C_G(h),  C_YY(h) = C_G(h),  C_XY(h) = c * C_G(h)
+# => ρ_true(h) = c (constante en h), y para incrementos la codispersión también ≈ c.
+#
+# Nota: Implementamos Matérn vía síntesis espectral:
+#   S(ω) ∝ (κ^2 + ||Aθ ω||^2)^(-(ν + d/2)),   d=2
+# y simulamos en Fourier con filtro sqrt(S).
+# La anisotropía se logra con la métrica elíptica Aθ (stretch + rotación).
+import numpy as np
+from typing import Tuple, Dict, List
+
+# -------------------------------
+# 1) Utilidades espectrales y anisotropía
+# -------------------------------
+def _freq_grids(n1: int, n2: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Mallas de frecuencias (rad/pixel) en convención FFT 2D:
+    K1: eje filas (vertical), K2: eje columnas (horizontal).
+    """
+    k1 = np.fft.fftfreq(n1) * 2*np.pi  # [0, 2π/N, ..., -2π/N]
+    k2 = np.fft.fftfreq(n2) * 2*np.pi
+    K2, K1 = np.meshgrid(k2, k1)
+    return K1, K2
+
+def _rotate(kx: np.ndarray, ky: np.ndarray, theta_rad: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Rotación en el plano de frecuencias: (kx,ky) -> (k'x,k'y)."""
+    ct, st = np.cos(theta_rad), np.sin(theta_rad)
+    kxp =  ct*kx + st*ky
+    kyp = -st*kx + ct*ky
+    return kxp, kyp
+
+def _elliptical_norm(kx: np.ndarray, ky: np.ndarray,
+                     stretch_x: float = 1.0, stretch_y: float = 1.0,
+                     theta_deg: float = 0.0) -> np.ndarray:
+    """
+    Norma elíptica ||Aθ k|| = sqrt( (sx*kx')^2 + (sy*ky')^2 ),
+    donde (kx',ky') son las frecuencias rotadas por theta.
+    - stretch_x > stretch_y produce mayor suavidad a lo largo de x' que de y'.
+    """
+    th = np.deg2rad(theta_deg)
+    kxp, kyp = _rotate(kx, ky, th)
+    return np.sqrt((stretch_x * kxp)**2 + (stretch_y * kyp)**2)
+
+# -------------------------------
+# 2) Filtro espectral Matérn y generador GRF Matérn
+# -------------------------------
+def matern_spectral_filter(nu: float, kappa: float,
+                           kx: np.ndarray, ky: np.ndarray,
+                           stretch_x: float = 1.0,
+                           stretch_y: float = 1.0,
+                           theta_deg: float = 0.0,
+                           eps: float = 1e-12) -> np.ndarray:
+    """
+    Filtro de amplitud para síntesis espectral del Matérn en 2D:
+      S(ω) ∝ (κ^2 + ||Aθ ω||^2)^(-(ν + d/2)), d=2
+    Para simular: usar sqrt(S) como filtro de magnitud.
+    """
+    d = 2.0
+    r_ell = _elliptical_norm(kx, ky, stretch_x, stretch_y, theta_deg)
+    base = kappa**2 + r_ell**2
+    alpha = (nu + d/2.0)
+    # Evitar singularidad en k=0 si nu es grande; eps asegura estabilidad numérica.
+    amp = (base + eps)**(-alpha/2.0)  # sqrt(S) ∝ base^(-alpha/2)
+    # Normalización relativa para no depender de escala absoluta (se estandariza luego):
+    amp /= np.max(amp)
+    return amp
+
+def grf_matern_2d(n1: int, n2: int, nu: float, kappa: float,
+                  stretch_x: float = 1.0, stretch_y: float = 1.0,
+                  theta_deg: float = 0.0,
+                  rng: np.random.Generator = None) -> np.ndarray:
+    """
+    Genera un GRF Matérn (real) en 2D vía IFFT de un campo blanco filtrado por sqrt(S).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    K1, K2 = _freq_grids(n1, n2)
+    A = matern_spectral_filter(nu, kappa, K1, K2, stretch_x, stretch_y, theta_deg)
+    # Ruido complejo
+    W = rng.normal(size=(n1, n2)) + 1j*rng.normal(size=(n1, n2))
+    Z_hat = A * W
+    Z = np.fft.ifft2(Z_hat).real
+    return Z
+
+def _stdz(Z: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    return (Z - Z.mean()) / (Z.std() + eps)
+
+# -------------------------------
+# 3) Conversión de "rango en pixeles" -> κ (kappa)
+# -------------------------------
+def kappa_from_range_pix(range_pix: float, nu: float) -> float:
+    """
+    Relación práctica (aprox.) entre el 'rango efectivo' y κ del Matérn:
+      r_eff (≈ 0.1 corr) ≈ sqrt(8ν) / κ  =>  κ ≈ sqrt(8ν) / r_eff
+    Usamos range_pix como proxy de r_eff (en pixeles).
+    """
+    range_pix = max(1.0, float(range_pix))
+    return np.sqrt(8.0*nu) / range_pix
+
+# -------------------------------
+# 4) Simulación bivariada Matérn con cross-covarianza (LMC)
+# -------------------------------
+def simulate_pair_matern_LMC(
+    n1: int,
+    n2: int,
+    rho0: float = 0.6,       # correlación cruzada objetivo (constante en h)
+    range_pix: float = 7.0,  # 'rango efectivo' aproximado en pixeles
+    nu: float = 1.0,         # suavidad Matérn
+    anis_mode: str = "iso",  # "iso" | "aniso"
+    angle_deg: float = 45.0, # orientación de la elipse si anis_mode="aniso"
+    anis_ratio: float = 2.0, # stretch_x : stretch_y si anisotrópico (ej. 2:1)
+    rng: np.random.Generator = None
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    Genera (X,Y) con modelo LMC: X = G, Y = c*G + sqrt(1-c^2)*H
+    G,H ~ Matérn(ν, κ, anisotropía) independientes.
+    - anis_mode="iso": stretch_x=stretch_y=1
+      "aniso": stretch_x=anis_ratio, stretch_y=1 (rotado por angle_deg)
+    Devuelve X,Y estandarizados y un dict con parámetros usados.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Mapear range_pix a κ (kappa)
+    kappa = kappa_from_range_pix(range_pix, nu)
+
+    if anis_mode == "iso":
+        sx, sy, th = 1.0, 1.0, 0.0
+    elif anis_mode == "aniso":
+        sx, sy, th = float(anis_ratio), 1.0, float(angle_deg)
+    else:
+        raise ValueError("anis_mode debe ser 'iso' o 'aniso'.")
+
+    # Campos latentes G y H con los mismos parámetros Matérn
+    G = grf_matern_2d(n1, n2, nu, kappa, sx, sy, th, rng)
+    H = grf_matern_2d(n1, n2, nu, kappa, sx, sy, th, rng)
+
+    G = _stdz(G)
+    H = _stdz(H)
+
+    # Mezcla LMC para inducir cross-covarianza C_XY = c*C_G
+    c = float(np.clip(rho0, -0.999, 0.999))
+    eta = np.sqrt(max(0.0, 1.0 - c**2))
+
+    X = G
+    Y = c * G + eta * H
+
+    # Estandarizar canales finales (manteniendo la estructura Matérn)
+    X = _stdz(X)
+    Y = _stdz(Y)
+
+    params = {
+        "rho0": rho0, "nu": nu, "kappa": kappa, "range_pix": range_pix,
+        "anis_mode": anis_mode, "anis_ratio": anis_ratio, "angle_deg": angle_deg,
+        "stretch_x": sx, "stretch_y": sy
+    }
+    return X, Y, params
+
+# -------------------------------
+# 5) Experimento mínimo usando el generador Matérn LMC
+# -------------------------------
+def run_min_experiment_matern(
+    n1: int = 256,
+    n2: int = 256,
+    rho0: float = 0.7,
+    range_pix: float = 7.0,
+    nu: float = 1.0,
+    anis_mode: str = "aniso",    # "iso" | "aniso"
+    angle_deg: float = 45.0,
+    anis_ratio: float = 2.0,
+    hmax: int = 2,
+    b: int = 57,
+    B: int = 400,
+    seed: int = 2025
+) -> Dict[str, Dict]:
+    """
+    - Genera (X,Y) ~ Matérn bivariado (LMC) con cross-cov controlada por rho0,
+    - Aplica Tukey 8 px (pareado) y estandariza,
+    - Calcula ρ̂(h) para h∈H y ejecuta CBB pareado (Var*, IC 95%).
+    Requiere funciones del BLOQUE 1: apply_tukey8, standardize_pair, build_H,
+                                      codisp_rho_hat, boot_codispersion_CBB.
+    """
+    rng = np.random.default_rng(seed)
+
+    # 1) Simulación Matérn LMC
+    X, Y, sim_params = simulate_pair_matern_LMC(
+        n1, n2, rho0=rho0, range_pix=range_pix, nu=nu,
+        anis_mode=anis_mode, angle_deg=angle_deg, anis_ratio=anis_ratio, rng=rng
+    )
+
+    # 2) Preprocesamiento pareado
+    X, Y = apply_tukey8(X, Y, k_px=8)    # (del BLOQUE 1)
+    X, Y = standardize_pair(X, Y)        # (del BLOQUE 1)
+
+    # 3) Lags y ρ̂(h)
+    H = build_H(hmax=hmax)               # (del BLOQUE 1)
+    rho_hat = {}
+    for h in H:
+        r, _ = codisp_rho_hat(X, Y, h, return_contrib=False)  # (del BLOQUE 1)
+        rho_hat[str(h)] = float(r)
+
+    # 4) Bootstrap CBB pareado
+    boot_res = boot_codispersion_CBB(X, Y, H, b=b, B=B, seed=seed, return_samples=False)  # (BLOQUE 1)
+
+    # Salida
+    out = {
+        "rho_hat": rho_hat,
+        "boot": boot_res,
+        "H": [tuple(h) for h in H],
+        "params": {
+            "n": (n1, n2), "b": b, "B": B, "hmax": hmax,
+            **sim_params, "nu": nu
+        }
+    }
+    return out
+
+# -------------------------------
+# 6) DEMO rápida al ejecutar este archivo
+# -------------------------------
+if __name__ == "__main__":
+    res = run_min_experiment_matern(
+        n1=256, n2=256,
+        rho0=0.75, range_pix=7.0, nu=1.0,
+        anis_mode="aniso", angle_deg=45.0, anis_ratio=2.0,
+        hmax=2, b=57, B=200, seed=2025
+    )
+    print("Parámetros de simulación:", res["params"])
+    print("Lags H:", res["H"])
+    print("ρ̂(h) por lag (Matérn LMC):")
+    for h, r in res["rho_hat"].items():
+        print(f"  h={h:>8s}  rho_hat={r: .6f}")
+    print("\nBootstrap (Var*, IC 95%):")
+    for h, info in res["boot"].items():
+        print(f"  h={h:>8s}  var*={info['var_boot']:.6e}  IC=({info['ci_lo']:.6f}, {info['ci_hi']:.6f})")
+
+__________________________________________________________________________________________________________
+
+# ============================================
+# BLOQUE 4P — VERSIÓN PARALELA (ideal Intel i5)
+# ============================================
+# Requisitos:
+# - BLOQUE 1 y BLOQUE 2.5 cargados
+# - pip install joblib (si no lo tienes)
+#
+# Qué hace:
+# • Igual que Bloque 4, pero paraleliza las R réplicas por escenario–b.
+# • Limita hilos internos de BLAS/FFT para evitar sobre-subscription.
+# • Permite “modo prueba” (params más pequeños) y “modo full”.
+#
+# Sugerencia i5 para prueba:
+#   R=120, B=400, n=256, Bsizes=[51,55,57]
+# Y para corrida final (si ves que va fluido):
+#   R=200–250, B=800, Bsizes=[45,51,55,57,59]
+
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from typing import Tuple, List, Dict
+
+# ===== Helpers (reusa los del Bloque 4 si ya están en memoria) =====
+def scenario_grid(rhos: List[float], ranges: List[float], anis_modes: List[str]) -> List[Dict]:
+    return [{"rho0": float(r0), "range_pix": float(rg), "anis_mode": am}
+            for r0 in rhos for rg in ranges for am in anis_modes]
+
+def summarize_montecarlo_per_lag(rho_hat_rep, var_boot_rep, ci_lo_rep, ci_hi_rep, rho_true):
+    R = rho_hat_rep.shape[0]
+    coverage = np.mean((rho_true >= ci_lo_rep) & (rho_true <= ci_hi_rep))
+    width = np.mean(ci_hi_rep - ci_lo_rep)
+    return {
+        "rho_hat_mean": float(np.mean(rho_hat_rep)),
+        "rho_hat_var_mc": float(np.var(rho_hat_rep, ddof=1)),
+        "var_boot_mean": float(np.mean(var_boot_rep)),
+        "coverage": float(coverage),
+        "width_mean": float(width),
+        "R": int(R)
+    }
+
+# ===== Trabajo por réplica (unidad paralelizable) =====
+def _one_replica_package(seed_r, n1, n2, rho0, rg, am, nu, angle_deg, anis_ratio, H, b, B):
+    rng_r = np.random.default_rng(seed_r)
+
+    # 1) Simular Matérn–LMC (del Bloque 2.5)
+    X, Y, _ = simulate_pair_matern_LMC(
+        n1, n2, rho0=rho0, range_pix=rg, nu=nu,
+        anis_mode=am, angle_deg=angle_deg, anis_ratio=anis_ratio, rng=rng_r
+    )
+    # 2) Preprocesar
+    X, Y = apply_tukey8(X, Y, k_px=8)
+    X, Y = standardize_pair(X, Y)
+
+    # 3) rho_hat por lag
+    rho_hat = {str(h): float(codisp_rho_hat(X, Y, h, return_contrib=False)[0]) for h in H}
+
+    # 4) Bootstrap CBB pareado
+    boot_res = boot_codispersion_CBB(X, Y, H, b=b, B=B, seed=seed_r, return_samples=False)
+
+    # empaquetar salidas mínimas por lag
+    out = {}
+    for h in H:
+        hs = str(h)
+        out[hs] = (
+            rho_hat[hs],
+            boot_res[hs]["var_boot"],
+            boot_res[hs]["ci_lo"],
+            boot_res[hs]["ci_hi"]
+        )
+    return out
+
+# ===== Estudio paralelo =====
+def run_study_multi_b_parallel_to_csv(
+    n1: int = 256, n2: int = 256, H: List[Tuple[int,int]] = None,
+    rhos: List[float] = (0.2, 0.5, 0.8),
+    ranges: List[float] = (3.0, 7.0, 12.0),
+    anis_modes: List[str] = ("iso", "aniso"),
+    Bsizes: List[int] = (45, 51, 55, 57, 59),
+    B: int = 400,   # prueba en i5
+    R: int = 120,   # prueba en i5 (sube luego)
+    nu: float = 1.0, angle_deg: float = 45.0, anis_ratio: float = 2.0,
+    base_seed: int = 2025,
+    n_jobs: int = -1,            # usa todos los núcleos lógicos disponibles
+    batch_size: int = 4,         # controla granularidad de envío de tareas
+    path_detailed_csv: str = "/mnt/data/detailed_rows_parallel.csv",
+    path_summary_csv: str = "/mnt/data/summary_scenario_parallel.csv",
+    verbose: bool = True
+) -> Dict:
+    if H is None:
+        H = build_H(hmax=2)
+    grid = scenario_grid(rhos, ranges, anis_modes)
+    rng_global = np.random.default_rng(base_seed)
+
+    detailed_rows = []
+    total_tasks = len(grid) * len(Bsizes)
+    task_id = 0
+
+    for sc_idx, sc in enumerate(grid):
+        rho0, rg, am = sc["rho0"], sc["range_pix"], sc["anis_mode"]
+
+        for b in Bsizes:
+            task_id += 1
+            if verbose:
+                print(f"[{task_id}/{total_tasks}] Escenario {sc_idx+1}: "
+                      f"rho0={rho0}, range={rg}, anis={am}, b={b}  -> R={R}, B={B}; paralelo n_jobs={n_jobs}")
+
+            # semillas por réplica
+            seeds = rng_global.integers(0, 2**31-1, size=R, dtype=np.int64)
+
+            # Ejecutar R réplicas en paralelo
+            rep_outputs = Parallel(n_jobs=n_jobs, batch_size=batch_size, prefer="threads")(
+                delayed(_one_replica_package)(
+                    int(seeds[r]), n1, n2, rho0, rg, am, nu, angle_deg, anis_ratio, H, b, B
+                ) for r in range(R)
+            )
+
+            # Reagrupar por lag
+            per_h = {str(h): {"rho": [], "v": [], "lo": [], "hi": []} for h in H}
+            for rep in rep_outputs:
+                for hs, tpl in rep.items():
+                    rhat, vboot, lo, hi = tpl
+                    per_h[hs]["rho"].append(rhat)
+                    per_h[hs]["v"].append(vboot)
+                    per_h[hs]["lo"].append(lo)
+                    per_h[hs]["hi"].append(hi)
+
+            # Agregar métricas y filas detalladas
+            for h in H:
+                hs = str(h); h1, h2 = h
+                rho_hat_rep = np.asarray(per_h[hs]["rho"])
+                var_boot_rep = np.asarray(per_h[hs]["v"])
+                ci_lo_rep = np.asarray(per_h[hs]["lo"])
+                ci_hi_rep = np.asarray(per_h[hs]["hi"])
+
+                metrics = summarize_montecarlo_per_lag(
+                    rho_hat_rep, var_boot_rep, ci_lo_rep, ci_hi_rep, rho_true=rho0
+                )
+
+                detailed_rows.append({
+                    "scenario_id": sc_idx,
+                    "rho0": rho0, "range_pix": rg, "anis_mode": am,
+                    "nu": nu, "n1": n1, "n2": n2,
+                    "b": b, "B": B, "R": R,
+                    "h1": h1, "h2": h2,
+                    "rho_hat_mean": metrics["rho_hat_mean"],
+                    "rho_hat_var_mc": metrics["rho_hat_var_mc"],
+                    "var_boot_mean": metrics["var_boot_mean"],
+                    "coverage": metrics["coverage"],
+                    "width_mean": metrics["width_mean"],
+                    "angle_deg": angle_deg, "anis_ratio": anis_ratio
+                })
+
+    # Exportar CSVs
+    df_det = pd.DataFrame(detailed_rows)
+    df_det.to_csv(path_detailed_csv, index=False)
+
+    group_cols = ["scenario_id","rho0","range_pix","anis_mode","nu","n1","n2","b","B","R","angle_deg","anis_ratio"]
+    agg_map = {
+        "rho_hat_mean":"mean","rho_hat_var_mc":"mean","var_boot_mean":"mean",
+        "coverage":"mean","width_mean":"mean"
+    }
+    df_sum = df_det.groupby(group_cols, as_index=False).agg(agg_map)
+    df_sum.rename(columns={
+        "rho_hat_mean":"rho_hat_mean_avg_h",
+        "rho_hat_var_mc":"rho_hat_var_mc_avg_h",
+        "var_boot_mean":"var_boot_mean_avg_h",
+        "coverage":"coverage_avg_h",
+        "width_mean":"width_mean_avg_h"
+    }, inplace=True)
+    df_sum.to_csv(path_summary_csv, index=False)
+
+    if verbose:
+        print(f"\n✔ Exportado:\n - {path_detailed_csv}\n - {path_summary_csv}")
+
+    return {
+        "detailed_csv": path_detailed_csv,
+        "summary_csv": path_summary_csv,
+        "n_rows_detailed": int(df_det.shape[0]),
+        "n_rows_summary": int(df_sum.shape[0]),
+        "H": H,
+        "scenarios": len(grid),
+        "Bsizes": list(Bsizes)
+    }
+
+# ===== MAIN: dos presets pensados para i5 =====
+if __name__ == "__main__":
+    H = build_H(hmax=2)
+
+    # --- (A) MODO PRUEBA EN i5 (recomendado primero) ---
+    print("\n>>> CORRIDA PRUEBA i5")
+    res_test = run_study_multi_b_parallel_to_csv(
+        n1=256, n2=256, H=H,
+        rhos=[0.2, 0.5, 0.8],
+        ranges=[3.0, 7.0, 12.0],
+        anis_modes=["iso","aniso"],
+        Bsizes=[57],   # menos b para reducir carga
+        B=400,               # bootstrap moderado
+        R=100,               # MC moderado
+        nu=1.0, angle_deg=45.0, anis_ratio=2.0,
+        base_seed=2025,
+        n_jobs=-1,           # usar todos los núcleos lógicos disponibles
+        batch_size=2,
+        path_detailed_csv="Full_detailed_rows_parallel_test.csv",
+        path_summary_csv="Full_summary_scenario_parallel_test.csv",
+        verbose=True
+    )
+    print("Resumen (test):", res_test)
+
+    # --- (B) MODO FULL i5 (cuando veas que el test fue estable) ---
+    # Descomenta lo siguiente cuando estés listo para la corrida grande:
+    """
+    print("\n>>> CORRIDA FULL i5")
+    res_full = run_study_multi_b_parallel_to_csv(
+        n1=256, n2=256, H=H,
+        rhos=[0.2, 0.5, 0.8],
+        ranges=[3.0, 7.0, 12.0],
+        anis_modes=["iso","aniso"],
+        Bsizes=[45,51,55,57,59],
+        B=800,               # bootstrap alto
+        R=200,               # MC alto (puedes subir a 250 si todo va bien)
+        nu=1.0, angle_deg=45.0, anis_ratio=2.0,
+        base_seed=2025,
+        n_jobs=-1,
+        batch_size=2,
+        path_detailed_csv="/mnt/data/detailed_rows_parallel_full.csv",
+        path_summary_csv="/mnt/data/summary_scenario_parallel_full.csv",
+        verbose=True
+    )
+    print("Resumen (full):", res_full)
+    """
+
+__________________________________________

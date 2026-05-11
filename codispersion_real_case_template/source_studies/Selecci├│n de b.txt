@@ -1,0 +1,523 @@
+Selección de b
+
+# =========================
+# SECCIÓN 5: Selección de b
+# =========================
+import numpy as np
+import pandas as pd
+from typing import List, Tuple, Dict, Optional
+
+def _estimate_reff(Z: np.ndarray, maxlag: Optional[int] = None) -> int:
+    """
+    Estima rango efectivo r_eff (95% del 'sill') desde un variograma radial omni rápido.
+    Usa _semi_variogram_radial(Z, maxlag) que ya definiste en la Sección 4.
+    """
+    n1, n2 = Z.shape
+    if maxlag is None:
+        maxlag = int(min(64, max(5, min(n1, n2)//3)))
+    gam = _semi_variogram_radial(Z, maxlag)  # gamma[0..maxlag]
+    # sill ~ promedio del 30% final (evita picos locales)
+    tail = gam[int(0.7*maxlag):] if maxlag >= 10 else gam[max(1, maxlag-3):]
+    sill = float(np.mean(tail))
+    thr  = 0.95 * sill
+    idx  = np.where(gam >= thr)[0]           # primer d con gamma(d) >= 0.95*sill
+    r_eff = int(idx[0]) if len(idx) else int(maxlag)
+    r_eff = max(r_eff, 5)
+    return r_eff
+
+def _make_odd(x: int) -> int:
+    x = int(max(3, round(x)))
+    return x if (x % 2 == 1) else x + 1
+
+def grid_from_reff(r_eff: int, widen: float = 0.2) -> List[int]:
+    """
+    Grilla de candidatos en [0.5 r_eff, 1.0 r_eff] ± widen.
+    Siempre impares y sin duplicados.
+    """
+    lo = max(3, int(round((0.5 - widen) * r_eff)))
+    hi = int(round((1.0 + widen) * r_eff))
+    cand: set = { _make_odd(b) for b in range(lo, hi + 1) }   # <-- mantener como set
+    # anclas típicas (unimos como conjuntos)
+    anchors = { _make_odd(t) for t in [0.4*r_eff, 0.5*r_eff, 0.6*r_eff, 0.8*r_eff, 1.0*r_eff, 1.2*r_eff] }
+    cand |= anchors
+    grid = sorted({ b for b in cand if b >= 3 })
+    return grid
+
+def score_b(
+    X: np.ndarray,
+    Y: np.ndarray,
+    H: List[Tuple[int,int]],
+    b: int,
+    scheme: str = "CBB",
+    B_small: int = 120,
+    R_diag: int = 12,
+    alpha: float = 0.05,
+    seed: Optional[int] = 1234,
+    w_bias: float = 3.0,
+    w_vario: float = 1.0,
+) -> Dict[str, float]:
+    """
+    Métrica compuesta:
+        bias  = mean_h | mean^*(rho_hat) - rho_hat |
+        vario = 0.5 * (relL2_gammaX + relL2_gammaY)
+        score = w_bias * bias + w_vario * vario
+    """
+    rng_seed = None if seed is None else int(seed)
+
+    # 1) Diagnóstico de mosaico (variogramas)
+    diag = validate_mosaic(X, Y, b=b, sampler=scheme, R=R_diag, H_small=None, seed=rng_seed)
+    vario_err = 0.5 * (float(diag["relL2_gammaX"]) + float(diag["relL2_gammaY"]))
+    if not np.isfinite(vario_err):
+        vario_err = float("inf")
+
+    # 2) Sesgo bootstrap en rho(h) con B_small
+    est0 = codispersion_xy(X, Y, H, mode="toroidal", min_pairs=1, nan_policy="omit")
+    res  = boot_codispersion(X, Y, H, B=B_small, b=b, scheme=scheme, alpha=alpha,
+                             seed=rng_seed, mode_estimator="toroidal",
+                             min_pairs=1, nan_policy="omit")
+
+    diffs = []
+    for h in H:
+        r0 = est0[h]["rho"] if est0[h]["status"] == "ok" else np.nan
+        boots = res[h]["rho_star"]
+        msk = np.isfinite(boots)
+        if np.isfinite(r0) and np.any(msk):
+            diffs.append(abs(np.nanmean(boots[msk]) - float(r0)))
+    bias = float(np.nanmean(diffs)) if len(diffs) else float("inf")
+
+    score = w_bias * bias + w_vario * vario_err
+    return dict(b=b, bias=bias, vario=vario_err, score=score)
+
+def select_block_size(
+    X: np.ndarray,
+    Y: np.ndarray,
+    H: List[Tuple[int,int]],
+    scheme: str = "CBB",
+    B_small: int = 120,
+    R_diag: int = 12,
+    alpha: float = 0.05,
+    seed: Optional[int] = 1234,
+    grid: Optional[List[int]] = None,
+) -> Tuple[int, pd.DataFrame]:
+    """
+    Selección de b:
+      1) si no das grilla, la arma con r_eff(X), r_eff(Y) (usa el menor / promedio).
+      2) evalúa score(b) en la grilla y elige el mínimo.
+    Devuelve (b_star, tabla ordenada por score asc).
+    """
+    if grid is None:
+        rX = _estimate_reff(X)
+        rY = _estimate_reff(Y)
+        r_eff = int(round(min(rX, rY)))  # conservador
+        grid = grid_from_reff(r_eff)
+
+    # aseguramos que b sea > 3*h_max para minimizar cruces en Δ_h
+    h_max = max(max(abs(h1), abs(h2)) for h1, h2 in H)
+    grid = [b for b in grid if b >= max(7, 3*h_max)]
+
+    # fallback si quedó vacía la grilla
+    if not grid:
+        base_b = _make_odd(max(7, 3*h_max))
+        grid = [base_b, base_b + 4, base_b + 8]
+
+    rows = []
+    for b in grid:
+        met = score_b(X, Y, H, b=b, scheme=scheme, B_small=B_small, R_diag=R_diag,
+                      alpha=alpha, seed=seed, w_bias=3.0, w_vario=1.0)
+        rows.append(met)
+    df = pd.DataFrame(rows).sort_values("score").reset_index(drop=True)
+    b_star = int(df.loc[0, "b"])
+    return b_star, df
+
+# ===================== Ejemplo de uso con tus 4 imágenes =====================
+if __name__ == "__main__":
+    from pathlib import Path
+    import imageio.v3 as iio
+
+    def load_gray(p):
+        arr = iio.imread(p)
+        return arr.mean(axis=2) if arr.ndim == 3 else arr
+
+    DATA = Path(".")  # ajusta si las tienes en otra carpeta
+    Xa = load_gray(DATA/"ch05_nano-a.png").astype(np.float64)
+    Yb = load_gray(DATA/"ch05_nano-b.png").astype(np.float64)
+    Xc = load_gray(DATA/"ch05_nano-c.png").astype(np.float64)
+    Yd = load_gray(DATA/"ch05_nano-d.png").astype(np.float64)
+
+    # Normalización + Tukey, como en P2–P3
+    Xa = apply_tukey2d((Xa - Xa.mean())/Xa.std(ddof=0), border_px=8)
+    Yb = apply_tukey2d((Yb - Yb.mean())/Yb.std(ddof=0), border_px=8)
+    Xc = apply_tukey2d((Xc - Xc.mean())/Xc.std(ddof=0), border_px=8)
+    Yd = apply_tukey2d((Yd - Yd.mean())/Yd.std(ddof=0), border_px=8)
+
+    # Lags fijados (coherentes con P3)
+    base = [(1,0),(0,1),(1,1),(-1,1)]
+    H = [(k*h1, k*h2) for k in (1,2) for (h1,h2) in base]
+
+    # ---- Selección de b para (a,b) ----
+    b_ab, tabla_ab = select_block_size(Xa, Yb, H, scheme="CBB", B_small=120, R_diag=12, seed=909)
+    print("\n[b* AB] =", b_ab)
+    print(tabla_ab.head(8).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+
+    # ---- Selección de b para (c,d) ----
+    b_cd, tabla_cd = select_block_size(Xc, Yd, H, scheme="CBB", B_small=120, R_diag=12, seed=910)
+    print("\n[b* CD] =", b_cd)
+    print(tabla_cd.head(8).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+
+    # ---- Bootstrap final con b* y B grande ----
+    B_final = 800
+    res_ab = boot_codispersion(Xa, Yb, H, B=B_final, b=b_ab, scheme="CBB", seed=123, alpha=0.05)
+    res_cd = boot_codispersion(Xc, Yd, H, B=B_final, b=b_cd, scheme="CBB", seed=124, alpha=0.05)
+
+    def _table(res: Dict[Tuple[int,int], Dict[str,object]]) -> pd.DataFrame:
+        rows = []
+        for h, r in res.items():
+            lo, hi = r["ci"]
+            rows.append(dict(h1=h[0], h2=h[1], rho=r["rho"], SE_boot=r["se_star"],
+                             IC95_lo=lo, IC95_hi=hi, m=r["m"], b=r["b"]))
+        return pd.DataFrame(rows).sort_values(["h1","h2"]).reset_index(drop=True)
+
+    print("\n=== Final (a,b) con b* ===")
+    print(_table(res_ab).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+    print("\n=== Final (c,d) con b* ===")
+    print(_table(res_cd).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+
+__________________________________________________________________________________________________________
+
+[b* AB] = 57
+ b    bias   vario   score
+57  0.0369  1.4958  1.6065
+55  0.0390  1.5463  1.6632
+53  0.0391  1.5485  1.6657
+51  0.0410  1.6358  1.7588
+47  0.0409  1.7276  1.8504
+49  0.0410  1.7366  1.8595
+45  0.0425  1.9115  2.0389
+43  0.0425  1.9196  2.0471
+
+[b* CD] = 57
+ b    bias   vario   score
+57  0.0328  1.3040  1.4023
+55  0.0341  1.5202  1.6224
+53  0.0341  1.5389  1.6413
+51  0.0358  1.5465  1.6539
+47  0.0356  1.6386  1.7455
+49  0.0357  1.6397  1.7468
+43  0.0368  1.8120  1.9223
+45  0.0367  1.8150  1.9251
+
+=== Final (a,b) con b* ===
+ h1  h2     rho  SE_boot  IC95_lo  IC95_hi      m  b
+ -2   2  0.9584   0.0024   0.9774   0.9869 262144 57
+ -1   1  0.9322   0.0039   0.9609   0.9765 262144 57
+  0   1  0.8952   0.0065   0.9339   0.9600 262144 57
+  0   2  0.9334   0.0042   0.9600   0.9765 262144 57
+  1   0  0.8983   0.0066   0.9350   0.9615 262144 57
+  1   1  0.9310   0.0040   0.9605   0.9764 262144 57
+  2   0  0.9343   0.0043   0.9602   0.9771 262144 57
+  2   2  0.9581   0.0024   0.9772   0.9868 262144 57
+
+=== Final (c,d) con b* ===
+ h1  h2     rho  SE_boot  IC95_lo  IC95_hi      m  b
+ -2   2  0.9651   0.0021   0.9813   0.9894 262144 57
+ -1   1  0.9412   0.0035   0.9675   0.9808 262144 57
+  0   1  0.9124   0.0057   0.9459   0.9685 262144 57
+  0   2  0.9453   0.0036   0.9672   0.9815 262144 57
+  1   0  0.9085   0.0061   0.9440   0.9671 262144 57
+  1   1  0.9412   0.0035   0.9673   0.9808 262144 57
+  2   0  0.9435   0.0038   0.9665   0.9807 262144 57
+  2   2  0.9652   0.0021   0.9813   0.9894 262144 57
+
+__________________________________________________________________________________________________________
+
+"""
+Double Bootstrap para elegir el tamaño de bloque b (cobertura objetivo).
+
+Requisitos: debes tener ya definidas/impotadas (Sección 4):
+  - codispersion_xy(...)
+  - cbb_sample_pair(...)
+  - boot_codispersion(...)
+  - validate_mosaic(...)   [opcional, para penalizar por estructura]
+  - _semi_variogram_radial(...)  [si usas validate_mosaic]
+
+Idea:
+  Para cada candidato b en una grilla:
+    - Outer bootstrap (R_outer veces) genera un "mundo" (X_out, Y_out) con CBB.
+    - En cada mundo, calculamos rho_out(h) (esto actúa como "verdad" local).
+    - Inner bootstrap (B_inner) sobre ese mundo construye IC_{1-α}(h) con bloque b.
+    - Medimos cobertura: 1{ rho_out(h) ∈ IC_{1-α}(h) }.
+  Elegimos b que minimiza el error de cobertura |cobertura_media - (1-α)|.
+  (Opcional) sumamos una penalización por mala preservación de variogramas del sampler.
+
+Devuelve b* y una tabla con métricas por b.
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import List, Tuple, Dict, Optional
+
+# ---------- helpers ----------
+def _make_odd(x: int) -> int:
+    x = int(max(3, round(x)))
+    return x if (x % 2 == 1) else x + 1
+
+def _grid_default_from_reff(X: np.ndarray, Y: np.ndarray) -> List[int]:
+    # r_eff rápido desde variograma radial (mismo helper que en la sección 5)
+    def _estimate_reff(Z: np.ndarray, maxlag: Optional[int] = None) -> int:
+        n1, n2 = Z.shape
+        if maxlag is None:
+            maxlag = int(min(64, max(5, min(n1, n2)//3)))
+        gam = _semi_variogram_radial(Z, maxlag)  # ya la tienes definida
+        tail = gam[int(0.7*maxlag):] if maxlag >= 10 else gam[max(1, maxlag-3):]
+        sill = float(np.mean(tail))
+        thr  = 0.95 * sill
+        idx  = np.where(gam >= thr)[0]
+        r_eff = int(idx[0]) if len(idx) else int(maxlag)
+        return max(r_eff, 5)
+
+    rX = _estimate_reff(X)
+    rY = _estimate_reff(Y)
+    r_eff = int(round(min(rX, rY)))
+
+    lo = max(3, int(round(0.5*r_eff)))
+    hi = int(round(1.2*r_eff))
+    cand = { _make_odd(b) for b in range(lo, hi+1) }
+    cand |= { _make_odd(t) for t in [0.5*r_eff, 0.6*r_eff, 0.8*r_eff, 1.0*r_eff, 1.2*r_eff] }
+    return sorted(cand)
+
+# ---------- núcleo: cobertura por double bootstrap ----------
+def _double_bootstrap_coverage_score(
+    X: np.ndarray,
+    Y: np.ndarray,
+    H: List[Tuple[int,int]],
+    b: int,
+    *,
+    scheme_outer: str = "CBB",
+    scheme_inner: str = "CBB",
+    R_outer: int = 40,
+    B_inner: int = 200,
+    alpha: float = 0.05,
+    seed: Optional[int] = 1234,
+    penalize_variogram: bool = True,
+    w_vario: float = 0.2,           # peso suave para la penalización de variogramas
+) -> Dict[str, float]:
+    """
+    Devuelve métricas para un b dado:
+      - cov_mean: cobertura promedio sobre h
+      - abs_err: |cov_mean - (1-α)|
+      - width:   ancho promedio de los IC
+      - se_mean: SE* promedio
+      - vario:   error relativo de variograma (si penalize_variogram=True)
+      - score:   abs_err + w_vario * vario
+    """
+    rng = np.random.default_rng(seed)
+    n1, n2 = X.shape
+
+    # Si quieres usar bloques outer algo más grandes:
+    b_outer = _make_odd(max(b, int(1.1*b)))  # leve inflado
+    # contadores por h
+    cover = {h: 0 for h in H}
+    widths = {h: [] for h in H}
+    se_list = {h: [] for h in H}
+
+    for r in range(R_outer):
+        # "Mundo" externo
+        Xo, Yo = cbb_sample_pair(X, Y, b=b_outer, scheme=scheme_outer, rng=rng)
+        # "Verdad" en el mundo r
+        est_out = codispersion_xy(Xo, Yo, H, mode="toroidal", min_pairs=1, nan_policy="omit")
+        # IC por inner bootstrap usando el b candidato
+        res_in  = boot_codispersion(Xo, Yo, H, B=B_inner, b=b, scheme=scheme_inner,
+                                    alpha=alpha, seed=int(rng.integers(1_000_000)))
+
+        for h in H:
+            if est_out[h]["status"] != "ok":
+                continue
+            rho_true = float(est_out[h]["rho"])
+            lo, hi = res_in[h]["ci"]
+            if np.isfinite(lo) and np.isfinite(hi) and lo <= rho_true <= hi:
+                cover[h] += 1
+            if np.isfinite(lo) and np.isfinite(hi):
+                widths[h].append(float(hi - lo))
+            if np.isfinite(res_in[h]["se_star"]):
+                se_list[h].append(float(res_in[h]["se_star"]))
+
+    # métricas agregadas
+    cov_rates = [cover[h] / R_outer for h in H]
+    cov_mean  = float(np.nanmean(cov_rates))
+    abs_err   = abs(cov_mean - (1.0 - alpha))
+    width     = float(np.nanmean([np.nanmean(widths[h]) if widths[h] else np.nan for h in H]))
+    se_mean   = float(np.nanmean([np.nanmean(se_list[h]) if se_list[h] else np.nan for h in H]))
+
+    # penalización por estructura (opcional)
+    vario_err = 0.0
+    if penalize_variogram:
+        diag = validate_mosaic(X, Y, b=b, sampler=scheme_inner, R=12, H_small=None, seed=seed)
+        vario_err = 0.5 * (float(diag["relL2_gammaX"]) + float(diag["relL2_gammaY"]))
+        if not np.isfinite(vario_err):
+            vario_err = 1e3  # gran penalización si algo va mal
+
+    score = abs_err + w_vario * vario_err
+    return dict(b=b, cov_mean=cov_mean, abs_err=abs_err, width=width,
+                se_mean=se_mean, vario=vario_err, score=score)
+
+# ---------- selección de b por double bootstrap ----------
+def select_block_size_double_bootstrap(
+    X: np.ndarray,
+    Y: np.ndarray,
+    H: List[Tuple[int,int]],
+    *,
+    grid: Optional[List[int]] = None,
+    scheme_outer: str = "CBB",
+    scheme_inner: str = "CBB",
+    R_outer: int = 40,
+    B_inner: int = 200,
+    alpha: float = 0.05,
+    seed: Optional[int] = 1234,
+    penalize_variogram: bool = True,
+    w_vario: float = 0.2,
+) -> Tuple[int, pd.DataFrame]:
+    """
+    Selecciona b minimizando 'score' = |cobertura - (1-α)| + w_vario * vario_error.
+    Devuelve (b*, tabla ordenada por score ascendente).
+    """
+    if grid is None:
+        grid = _grid_default_from_reff(X, Y)
+
+    # aseguramos b ≥ 3*h_max (minimiza cruces de Δ_h entre bloques)
+    h_max = max(max(abs(h1), abs(h2)) for h1, h2 in H)
+    grid = [b for b in grid if b >= max(7, 3*h_max)]
+    if not grid:
+        base_b = _make_odd(max(7, 3*h_max))
+        grid = [base_b, base_b+4, base_b+8]
+
+    rows = []
+    for b in grid:
+        met = _double_bootstrap_coverage_score(
+            X, Y, H, b,
+            scheme_outer=scheme_outer, scheme_inner=scheme_inner,
+            R_outer=R_outer, B_inner=B_inner, alpha=alpha, seed=seed,
+            penalize_variogram=penalize_variogram, w_vario=w_vario
+        )
+        rows.append(met)
+
+    df = pd.DataFrame(rows).sort_values("score").reset_index(drop=True)
+    b_star = int(df.loc[0, "b"])
+    return b_star, df
+
+# ----------------- ejemplo de uso con tus 4 imágenes (opcional) -----------------
+if __name__ == "__main__":
+    from pathlib import Path
+    import imageio.v3 as iio
+
+    def load_gray(p):
+        arr = iio.imread(p)
+        return arr.mean(axis=2) if arr.ndim == 3 else arr
+
+    # Carga tus imágenes reales (ajusta ruta si hace falta)
+    DATA = Path(".")
+    Xa = load_gray(DATA/"ch05_nano-a.png").astype(np.float64)
+    Yb = load_gray(DATA/"ch05_nano-b.png").astype(np.float64)
+    Xc = load_gray(DATA/"ch05_nano-c.png").astype(np.float64)
+    Yd = load_gray(DATA/"ch05_nano-d.png").astype(np.float64)
+
+    # Preprocesamiento coherente (z-score + Tukey)
+    def zscore(Z): Z = Z.astype(np.float64); return (Z - Z.mean())/(Z.std(ddof=0) or 1.0)
+    Xa = apply_tukey2d(zscore(Xa), border_px=8)
+    Yb = apply_tukey2d(zscore(Yb), border_px=8)
+    Xc = apply_tukey2d(zscore(Xc), border_px=8)
+    Yd = apply_tukey2d(zscore(Yd), border_px=8)
+
+    # Lags fijados (como en P3)
+    base = [(1,0),(0,1),(1,1),(-1,1)]
+    H = [(k*h1, k*h2) for k in (1,2) for (h1,h2) in base]
+
+    # --- Selección de b por Double Bootstrap para (a,b) ---
+    b_ab, tabla_ab = select_block_size_double_bootstrap(
+        Xa, Yb, H,
+        grid=None,              # o por ejemplo: [41,45,49,53,57,61,65]
+        R_outer=40,             # súbelo (80–120) para informe final
+        B_inner=200,            # súbelo (400–800) para informe final
+        alpha=0.05, seed=777,
+        penalize_variogram=True, w_vario=0.2
+    )
+    print("\n[b* AB - DoubleBootstrap] =", b_ab)
+    print(tabla_ab.head(10).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+
+    # --- Selección de b por Double Bootstrap para (c,d) ---
+    b_cd, tabla_cd = select_block_size_double_bootstrap(
+        Xc, Yd, H,
+        grid=None,
+        R_outer=40, B_inner=200, alpha=0.05, seed=778,
+        penalize_variogram=True, w_vario=0.2
+    )
+    print("\n[b* CD - DoubleBootstrap] =", b_cd)
+    print(tabla_cd.head(10).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+
+    # --- Bootstrap final con los b* seleccionados ---
+    B_final = 800  # 500–1000 recomendado
+    res_ab = boot_codispersion(Xa, Yb, H, B=B_final, b=b_ab, scheme="CBB", seed=2025, alpha=0.05)
+    res_cd = boot_codispersion(Xc, Yd, H, B=B_final, b=b_cd, scheme="CBB", seed=2026, alpha=0.05)
+
+    def _table(res: Dict[Tuple[int,int], Dict[str,object]]) -> pd.DataFrame:
+        rows = []
+        for h, r in res.items():
+            lo, hi = r["ci"]
+            rows.append(dict(h1=h[0], h2=h[1], rho=r["rho"], SE_boot=r["se_star"],
+                             IC95_lo=lo, IC95_hi=hi, m=r["m"], b=r["b"]))
+        return pd.DataFrame(rows).sort_values(["h1","h2"]).reset_index(drop=True)
+
+    print("\n=== Final (a,b) con b* (DoubleBootstrap) ===")
+    print(_table(res_ab).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+    print("\n=== Final (c,d) con b* (DoubleBootstrap) ===")
+    print(_table(res_cd).to_string(index=False, float_format=lambda x: f"{x: .4f}"))
+
+__________________________________________________________________________________________________________
+
+[b* AB - DoubleBootstrap] = 57
+ b  cov_mean  abs_err   width  se_mean   vario   score
+57    0.0000   0.9500  0.0078   0.0020  1.4315  1.2363
+55    0.0000   0.9500  0.0071   0.0019  1.5586  1.2617
+53    0.0000   0.9500  0.0070   0.0018  1.5647  1.2629
+51    0.0000   0.9500  0.0066   0.0017  1.6278  1.2756
+49    0.0000   0.9500  0.0059   0.0016  1.7318  1.2964
+47    0.0000   0.9500  0.0059   0.0015  1.7418  1.2984
+45    0.0000   0.9500  0.0054   0.0014  1.8886  1.3277
+43    0.0000   0.9500  0.0053   0.0014  1.9063  1.3313
+41    0.0000   0.9500  0.0047   0.0012  2.0451  1.3590
+39    0.0000   0.9500  0.0044   0.0011  2.1017  1.3703
+
+[b* CD - DoubleBootstrap] = 57
+ b  cov_mean  abs_err   width  se_mean   vario   score
+57    0.0000   0.9500  0.0074   0.0020  1.3688  1.2238
+51    0.0000   0.9500  0.0066   0.0017  1.5183  1.2537
+55    0.0000   0.9500  0.0070   0.0018  1.5186  1.2537
+53    0.0000   0.9500  0.0068   0.0018  1.5201  1.2540
+49    0.0000   0.9500  0.0059   0.0015  1.6291  1.2758
+47    0.0000   0.9500  0.0059   0.0016  1.6319  1.2764
+43    0.0000   0.9500  0.0053   0.0014  1.7465  1.2993
+45    0.0000   0.9500  0.0055   0.0014  1.7530  1.3006
+41    0.0000   0.9500  0.0048   0.0013  1.8989  1.3298
+39    0.0000   0.9500  0.0046   0.0012  2.0341  1.3568
+
+=== Final (a,b) con b* (DoubleBootstrap) ===
+ h1  h2     rho  SE_boot  IC95_lo  IC95_hi      m  b
+ -2   2  0.9584   0.0024   0.9774   0.9866 262144 57
+ -1   1  0.9322   0.0039   0.9608   0.9758 262144 57
+  0   1  0.8952   0.0067   0.9340   0.9599 262144 57
+  0   2  0.9334   0.0044   0.9597   0.9767 262144 57
+  1   0  0.8983   0.0063   0.9359   0.9597 262144 57
+  1   1  0.9310   0.0040   0.9605   0.9758 262144 57
+  2   0  0.9343   0.0041   0.9607   0.9762 262144 57
+  2   2  0.9581   0.0024   0.9773   0.9866 262144 57
+
+=== Final (c,d) con b* (DoubleBootstrap) ===
+ h1  h2     rho  SE_boot  IC95_lo  IC95_hi      m  b
+ -2   2  0.9651   0.0022   0.9809   0.9891 262144 57
+ -1   1  0.9412   0.0036   0.9668   0.9805 262144 57
+  0   1  0.9124   0.0057   0.9458   0.9680 262144 57
+  0   2  0.9453   0.0037   0.9671   0.9811 262144 57
+  1   0  0.9085   0.0063   0.9430   0.9671 262144 57
+  1   1  0.9412   0.0036   0.9668   0.9803 262144 57
+  2   0  0.9435   0.0039   0.9660   0.9807 262144 57
+  2   2  0.9652   0.0021   0.9811   0.9892 262144 57

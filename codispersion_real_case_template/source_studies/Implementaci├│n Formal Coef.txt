@@ -1,0 +1,363 @@
+Implementación Formal de $\hat\rho(h)$ y bootstrap por bloques
+
+# ============================================================
+# Punto 3 — Codispersión como PROMEDIO DE CONTRIBUCIONES
+# Implementación + tests (C: rank-1, B: sintéticos) + smoke real (A)
+# ------------------------------------------------------------
+# Requisitos: numpy (>=1.20). Para leer imágenes reales: imageio.v3 ó PIL.
+# Reproducible con semilla fija.
+# ============================================================
+
+import numpy as np
+import math
+from typing import Tuple, List, Dict, Iterable
+
+# -------------------- Utilidades base --------------------
+def tukey_1d(N:int, k:int) -> np.ndarray:
+    """Ventana Tukey con 'k' pixeles de rampa senoidal en cada borde."""
+    alpha = min(1.0, max(0.0, 2.0 * k / max(1, N - 1)))
+    n = np.arange(N, dtype=np.float64)
+    if alpha <= 0.0:
+        return np.ones(N, np.float64)
+    if alpha >= 1.0:
+        return 0.5 * (1 - np.cos(2*np.pi*n/(N-1)))
+    w = np.ones(N, np.float64)
+    edge = int(np.floor(alpha * (N - 1) / 2.0))
+    w[:edge] = 0.5 * (1 + np.cos(np.pi * (2*np.arange(edge)/(alpha*(N-1)) - 1)))
+    w[-edge:] = w[:edge][::-1]
+    return w
+
+def tukey2d(n1:int, n2:int, k:int) -> np.ndarray:
+    return np.outer(tukey_1d(n1,k), tukey_1d(n2,k))
+
+def roll_diff(Z:np.ndarray, h:Tuple[int,int]) -> np.ndarray:
+    """Δ_h Z(s) con envoltura toroidal."""
+    h1,h2 = int(h[0]), int(h[1])
+    return np.roll(Z, shift=(h1,h2), axis=(0,1)) - Z
+
+def slices_interior(n1:int, n2:int, h1:int, h2:int):
+    """Slices alineados para pares interiores (s, s+h)."""
+    i0 = max(0,  h1); i1 = n1 + min(0,  h1)
+    j0 = max(0,  h2); j1 = n2 + min(0,  h2)
+    S0 = np.s_[i0:i1, j0:j1]
+    S1 = np.s_[i0-h1:i1-h1, j0-h2:j1-h2]
+    return S0, S1
+
+# -------------------- Estimador — PROMEDIO DE CONTRIBUCIONES --------------------
+def codispersion_empirica(
+    X:np.ndarray, Y:np.ndarray, h:Tuple[int,int],
+    mode:str="toroidal", min_pairs:int=1, nan_policy:str="omit",
+    return_contrib:bool=True
+) -> Dict[str, object]:
+    """
+    Estima ρ̂(h) = (1/m) Σ s_i(h) con s_i(h) = Δ_hX Δ_hY / √(Ā(h) B̄(h)).
+    Devuelve: {'rho','Abar','Bbar','m','S','status'}.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    Y = np.asarray(Y, dtype=np.float64)
+    h1,h2 = int(h[0]), int(h[1])
+
+    if mode == "toroidal":
+        DX = roll_diff(X, (h1,h2))
+        DY = roll_diff(Y, (h1,h2))
+    elif mode == "interior":
+        S0,S1 = slices_interior(*X.shape,h1,h2)
+        DX = X[S1] - X[S0]
+        DY = Y[S1] - Y[S0]
+    else:
+        raise ValueError("mode must be 'toroidal' or 'interior'.")
+
+    # Manejo de NaN
+    if nan_policy == "omit":
+        mask = np.isfinite(DX) & np.isfinite(DY)
+        DX = DX[mask]; DY = DY[mask]
+    elif nan_policy == "propagate":
+        if not (np.isfinite(DX).all() and np.isfinite(DY).all()):
+            return {"rho": np.nan, "Abar": np.nan, "Bbar": np.nan, "m": 0, "S": None, "status": "nan_present"}
+    else:
+        raise ValueError("nan_policy must be 'omit' or 'propagate'.")
+
+    m = DX.size
+    if m < min_pairs:
+        return {"rho": np.nan, "Abar": np.mean(DX*DX) if m>0 else np.nan,
+                "Bbar": np.mean(DY*DY) if m>0 else np.nan, "m": int(m),
+                "S": None, "status":"too_few_pairs"}
+
+    Abar = float(np.mean(DX*DX))
+    Bbar = float(np.mean(DY*DY))
+    if not (Abar>0 and Bbar>0):
+        return {"rho": np.nan, "Abar":Abar, "Bbar":Bbar, "m":int(m), "S":None, "status":"zero_variance"}
+
+    norm = math.sqrt(Abar*Bbar)
+    S = (DX*DY)/norm
+    rho = float(np.mean(S))
+    out = {"rho": rho, "Abar":Abar, "Bbar":Bbar, "m":int(m), "status":"ok"}
+    if return_contrib: out["S"] = S
+    return out
+
+def codispersion_sobre_H(X:np.ndarray, Y:np.ndarray, H:Iterable[Tuple[int,int]], **kwargs):
+    return [dict(h=tuple(h), **codispersion_empirica(X,Y,h,**kwargs)) for h in H]
+
+# -------------------- Variogramas y r_eff --------------------
+def variogram_toroidal(Z:np.ndarray, h:Tuple[int,int]) -> float:
+    D = roll_diff(Z,h); return float((D*D).mean())
+
+def radial_variogram(Z:np.ndarray, max_r:int=8):
+    vals={}
+    for h1 in range(-max_r,max_r+1):
+        for h2 in range(-max_r,max_r+1):
+            if h1==0 and h2==0: continue
+            d = math.hypot(h1,h2)
+            if d>max_r: continue
+            vals.setdefault(d, []).append(variogram_toroidal(Z,(h1,h2)))
+    ds = sorted(vals); gammas=[float(np.mean(vals[d])) for d in ds]
+    return np.array(ds), np.array(gammas)
+
+def effective_range(ds:np.ndarray, gammas:np.ndarray, pct:float=0.95) -> float:
+    """Rango efectivo: distancia donde γ(d) alcanza el 95% del 'sill' (promedio top-k)."""
+    k = min(3, len(gammas))
+    sill = float(np.mean(np.sort(gammas)[-k:]))
+    thr = pct*sill
+    for d,g in zip(ds,gammas):
+        if g >= thr: return float(d)
+    return float(ds[-1])
+
+def propose_H(r_eff:float, cap:int=2):
+    """Conjunto de lags: direcciones base y múltiplos k=1..h_max, h_max=min(2,⌊0.5 r_eff⌋)."""
+    hmax = min(max(1,int(np.floor(0.5*r_eff))), cap)
+    H=set()
+    for base in [(1,0),(0,1),(1,1),(-1,1)]:
+        for k in range(1,hmax+1):
+            H.add((base[0]*k, base[1]*k))
+    return sorted(H), hmax
+
+def dir_anisotropy_ratio_avg(Z:np.ndarray, ks=(1,2,3)) -> float:
+    """Promedio de γ(h) en 4 direcciones y k=1..3; razón max/min."""
+    dirs = [(1,0),(0,1),(1,1),(-1,1)]
+    acc = np.zeros(len(dirs), dtype=float)
+    for k in ks:
+        vals = [variogram_toroidal(Z,(k*d[0], k*d[1])) for d in dirs]
+        acc += np.array(vals, float)
+    acc /= len(ks)
+    return float(acc.max()/max(acc.min(),1e-12))
+
+# -------------------- Convolución y generadores sintéticos (B y C) --------------------
+def gaussian_kernel_2d(sx:float, sy:float=None, theta_deg:float=0.0, tol:float=1e-3):
+    if sy is None: sy = sx
+    theta = np.deg2rad(theta_deg)
+    R = int(np.ceil(1.2 * max(3, int(np.ceil(3.5*sx)), int(np.ceil(3.5*sy)))))
+    xs = np.arange(-R,R+1); ys = np.arange(-R,R+1)
+    X,Y = np.meshgrid(xs,ys,indexing="xy")
+    c,s = np.cos(theta), np.sin(theta)
+    Xp =  c*X + s*Y; Yp = -s*X + c*Y
+    K = np.exp(-0.5*((Xp/sx)**2 + (Yp/sy)**2))
+    K /= K.max(); K *= (K>=tol); K/= (K.sum()+1e-12)
+    return K
+
+def fftconv2(a:np.ndarray, k:np.ndarray) -> np.ndarray:
+    pad = np.zeros_like(a, dtype=np.float64)
+    kh,kw = k.shape
+    pad[:kh,:kw] = k
+    pad = np.roll(np.roll(pad,-kh//2,axis=0),-kw//2,axis=1)
+    A = np.fft.rfft2(a); K = np.fft.rfft2(pad)
+    return np.fft.irfft2(A*K, s=a.shape).astype(np.float64)
+
+def standardize(Z:np.ndarray) -> np.ndarray:
+    Z = Z - Z.mean(); s = Z.std()
+    return (Z/s if s>0 else Z).astype(np.float64)
+
+# Semilla fija para reproducibilidad
+RNG = np.random.default_rng(2025)
+
+def model_rank1(n=160, sigma=3.0):
+    W = RNG.standard_normal((n,n))
+    X = standardize(fftconv2(W, gaussian_kernel_2d(sigma,sigma,0)))
+    return X, X.copy(), -X.copy()
+
+def model1_alignment(n=192, c=0.8, sx=3.0, seps=2.0, noise_ratio=0.25, taper_k=8):
+    W = RNG.standard_normal((n,n)); E=RNG.standard_normal((n,n))
+    X0 = standardize(fftconv2(W, gaussian_kernel_2d(sx,sx,0)))
+    eps= standardize(fftconv2(E, gaussian_kernel_2d(seps,seps,0))) * noise_ratio
+    X = X0; Y = c*X0 + eps
+    Wt = tukey2d(n,n,taper_k); return X*Wt, Y*Wt
+
+def model2_diff_ranges(n=192, sx_x=1.4, sx_y=7.0, noise_ratio=0.12, taper_k=8):
+    G = RNG.standard_normal((n,n))
+    X  = standardize(fftconv2(G, gaussian_kernel_2d(sx_x,sx_x,0)))
+    Y0 = standardize(fftconv2(G, gaussian_kernel_2d(sx_y,sx_y,0)))
+    N  = standardize(fftconv2(RNG.standard_normal((n,n)), gaussian_kernel_2d(2,2,0))) * noise_ratio
+    Y = Y0 + N
+    Wt = tukey2d(n,n,taper_k); return X*Wt, Y*Wt
+
+def model3_anisotropy_corr(n=192, sx_iso=8.0, sx_an=7.0, sy_an=2.0, theta=45.0, noise_ratio=0.08, taper_k=8):
+    """Anisotropía en Y, X casi isotrópico. Se usa un mismo campo base para correlacionar."""
+    Gc = RNG.standard_normal((n,n))
+    X  = standardize(fftconv2(Gc, gaussian_kernel_2d(sx_iso,sx_iso,0)))
+    Y0 = standardize(fftconv2(Gc, gaussian_kernel_2d(sx_an,sy_an,theta)))
+    N  = standardize(fftconv2(RNG.standard_normal((n,n)), gaussian_kernel_2d(2,2,0))) * noise_ratio
+    Y = Y0 + N
+    Wt = tukey2d(n,n,taper_k); return X*Wt, Y*Wt
+
+# -------------------- Tests (C) Rank-1 --------------------
+def _assert_close(a,b,tol=1e-12,msg=""):
+    if not (abs(a-b) <= tol or (np.isnan(a) and np.isnan(b))):
+        raise AssertionError(msg or f"Expected {b}, got {a}")
+
+def unit_tests_rank1(verbose=True) -> bool:
+    X, Y_id, Y_neg = model_rank1()
+    dsX,gX = radial_variogram(X,8)
+    r_eff = effective_range(dsX,gX,0.95)
+    H,_ = propose_H(r_eff, cap=2)
+    # Equivalencia promedio de s_i vs C/√(AB)
+    for h in H:
+        res = codispersion_empirica(X, Y_id, h, return_contrib=True)
+        DX = roll_diff(X,h); DY = roll_diff(Y_id,h)
+        C = float((DX*DY).sum()); A=float((DX*DX).sum()); B=float((DY*DY).sum())
+        rho_classic = C/ math.sqrt(A*B)
+        _assert_close(res["rho"], rho_classic, 1e-12, "Equivalencia falló")
+    # Simetrías, invariancias (escala positiva y nivel), cotas y casos Rank-1
+    for h in H:
+        r_xy = codispersion_empirica(X, Y_id, h)["rho"]
+        r_yx = codispersion_empirica(Y_id, X, h)["rho"]
+        r_xm = codispersion_empirica(X, -Y_id, h)["rho"]
+        _assert_close(r_xy, r_yx, 1e-12, "Simetría XY≠YX")
+        _assert_close(r_xy, -r_xm, 1e-12, "Signo con -Y falló")
+        r_pos = codispersion_empirica(2.7*X+5.0, 3.0*Y_id+7.0, h)["rho"]
+        _assert_close(r_xy, r_pos, 1e-12, "Invariancias (escala>0,nivel) fallaron")
+        assert abs(r_xy) <= 1 + 1e-12
+        _assert_close(codispersion_empirica(X, Y_id, h)["rho"], +1.0, 1e-12, "Rank-1 Y=X")
+        _assert_close(codispersion_empirica(X, Y_neg, h)["rho"], -1.0, 1e-12, "Rank-1 Y=-X")
+    # Umbral min_pairs
+    tiny = np.arange(9,dtype=float).reshape(3,3)
+    res = codispersion_empirica(tiny,tiny,(2,2), mode="interior", min_pairs=50)
+    assert res["status"] == "too_few_pairs"
+    if verbose: print("✓ Unit tests (Rank-1 C): OK")
+    return True
+
+# -------------------- Tests de comportamiento (B) --------------------
+def behavior_tests_B(verbose=True) -> bool:
+    ok = True
+    # M1: alineación + ruido
+    X1,Y1 = model1_alignment()
+    rho10 = codispersion_empirica(X1,Y1,(1,0))["rho"]
+    cond1 = (rho10 > 0.70)  # alto positivo
+    ok &= cond1
+    if verbose: print(f"M1: rho(1,0)={rho10:.3f} ⇒ {'OK' if cond1 else 'FAIL'}")
+
+    # M2: rangos distintos
+    X2,Y2 = model2_diff_ranges()
+    dsX,gX = radial_variogram(X2,8); dsY,gY = radial_variogram(Y2,8)
+    rX = effective_range(dsX,gX,0.95); rY = effective_range(dsY,gY,0.95)
+    rho10 = codispersion_empirica(X2,Y2,(1,0))["rho"]
+    cond2 = (abs(rX - rY) >= 1.5) and (0.05 <= rho10 <= 0.85)
+    ok &= cond2
+    if verbose: print(f"M2: |Δr_eff|={abs(rX-rY):.2f}, rho(1,0)={rho10:.3f} ⇒ {'OK' if cond2 else 'FAIL'}")
+
+    # M3: anisotropía correlacionada en Y
+    X3,Y3 = model3_anisotropy_corr()
+    ratioY = dir_anisotropy_ratio_avg(Y3, ks=(1,2,3)); ratioX = dir_anisotropy_ratio_avg(X3, ks=(1,2,3))
+    rho10 = codispersion_empirica(X3,Y3,(1,0))["rho"]
+    cond3 = (ratioY > 1.4) and ((ratioY/max(ratioX,1e-12)) > 1.3) and (rho10 > 0.25)
+    ok &= cond3
+    if verbose: print(f"M3: anisY={ratioY:.2f}, anisX={ratioX:.2f}, rho(1,0)={rho10:.3f} ⇒ {'OK' if cond3 else 'FAIL'}")
+
+    if verbose: print("Behavior tests (B):" if ok else "Behavior tests (B): FAIL")
+    return ok
+
+# -------------------- Datos reales (A) --------------------
+def load_img(path:str) -> np.ndarray:
+    """Intenta cargar la imagen (gris) usando imageio.v3 o PIL como fallback."""
+    arr = None
+    try:
+        import imageio.v3 as iio
+        arr = iio.imread(path)
+    except Exception:
+        try:
+            from PIL import Image
+            arr = np.array(Image.open(path))
+        except Exception as e:
+            raise RuntimeError(f"No pude leer la imagen: {path} ({e})")
+    arr = arr.astype(np.float64)
+    if arr.ndim == 3:
+        arr = 0.2989*arr[...,0] + 0.5870*arr[...,1] + 0.1140*arr[...,2]
+    return arr
+
+def run_real_pair(pathX:str, pathY:str, taper_k:int=8, verbose=True):
+    X = load_img(pathX); Y = load_img(pathY)
+    # Normalización y taper pareado
+    X = (X - X.mean())/(X.std() + 1e-12)
+    Y = (Y - Y.mean())/(Y.std() + 1e-12)
+    Wt = tukey2d(*X.shape, taper_k)
+    X = X*Wt; Y = Y*Wt
+    dsX,gX = radial_variogram(X,8); dsY,gY = radial_variogram(Y,8)
+    r_eff = min(effective_range(dsX,gX,0.95), effective_range(dsY,gY,0.95))
+    H,_ = propose_H(r_eff, cap=2)
+    rows = []; ok = True
+    for h in H:
+        res = codispersion_empirica(X,Y,h,mode="toroidal",min_pairs=1)
+        rows.append((h, res["rho"], res["m"], res["status"]))
+        ok &= (res["status"]=="ok") and np.isfinite(res["rho"]) and (abs(res["rho"])<=1+1e-12)
+    if verbose:
+        print(f"\nReal pair ({pathX.split('/')[-1]}, {pathY.split('/')[-1]}) -> r_eff={r_eff:.2f}, |H|={len(H)}")
+        for h,rho,m,status in rows:
+            print(f"  h={str(h):>7s}  rho={rho:+.6f}  m={m:6d}  status={status}")
+    return ok
+
+# -------------------- MAIN: Ejecutar todo --------------------
+if __name__ == "__main__":
+    # (1) Tests C
+    all_ok = unit_tests_rank1(verbose=True)
+    # (2) Tests B
+    all_ok &= behavior_tests_B(verbose=True)
+
+    # (3) PRUEBA CON DATOS REALES — reemplaza rutas si es necesario
+    # Si tus archivos se llaman exactamente 'ch05_nano-a.png' ... 'ch05_nano-d.png'
+    # y están en el directorio actual, usa "./ch05_nano-a.png", etc.
+    PATH_A = "ch05_nano-a.png"
+    PATH_B = "ch05_nano-b.png"
+    PATH_C = "ch05_nano-c.png"
+    PATH_D = "ch05_nano-d.png"
+
+    try:
+        ok_ab = run_real_pair(PATH_A, PATH_B, taper_k=8, verbose=True)
+        ok_cd = run_real_pair(PATH_C, PATH_D, taper_k=8, verbose=True)
+        all_ok &= (ok_ab and ok_cd)
+    except RuntimeError as e:
+        print("Datos reales no verificados (no se encontraron/leyeron imágenes).")
+        print("Mensaje:", e)
+
+    print("\n=== CRITERIO DE ÉXITO (Punto 3) ===")
+    print("API vectorizada (promedio contribuciones), unit tests (C), behavior (B) y real (A) sin artefactos.")
+    print(f"=> Resultado final: {'CUMPLIDO' if all_ok else 'NO CUMPLIDO'}")
+
+__________________________________________________________________________________________________________
+
+✓ Unit tests (Rank-1 C): OK
+M1: rho(1,0)=0.915 ⇒ OK
+M2: |Δr_eff|=2.62, rho(1,0)=0.148 ⇒ OK
+M3: anisY=7.47, anisX=2.26, rho(1,0)=0.331 ⇒ OK
+Behavior tests (B):
+
+Real pair (ch05_nano-a.png, ch05_nano-b.png) -> r_eff=7.21, |H|=8
+  h=(-2, 2)  rho=+0.958573  m=262144  status=ok
+  h=(-1, 1)  rho=+0.932443  m=262144  status=ok
+  h= (0, 1)  rho=+0.895664  m=262144  status=ok
+  h= (0, 2)  rho=+0.933672  m=262144  status=ok
+  h= (1, 0)  rho=+0.898709  m=262144  status=ok
+  h= (1, 1)  rho=+0.931323  m=262144  status=ok
+  h= (2, 0)  rho=+0.934592  m=262144  status=ok
+  h= (2, 2)  rho=+0.958248  m=262144  status=ok
+
+Real pair (ch05_nano-c.png, ch05_nano-d.png) -> r_eff=7.21, |H|=8
+  h=(-2, 2)  rho=+0.965189  m=262144  status=ok
+  h=(-1, 1)  rho=+0.941311  m=262144  status=ok
+  h= (0, 1)  rho=+0.912626  m=262144  status=ok
+  h= (0, 2)  rho=+0.945372  m=262144  status=ok
+  h= (1, 0)  rho=+0.908681  m=262144  status=ok
+  h= (1, 1)  rho=+0.941322  m=262144  status=ok
+  h= (2, 0)  rho=+0.943594  m=262144  status=ok
+  h= (2, 2)  rho=+0.965284  m=262144  status=ok
+
+=== CRITERIO DE ÉXITO (Punto 3) ===
+API vectorizada (promedio contribuciones), unit tests (C), behavior (B) y real (A) sin artefactos.
+=> Resultado final: CUMPLIDO

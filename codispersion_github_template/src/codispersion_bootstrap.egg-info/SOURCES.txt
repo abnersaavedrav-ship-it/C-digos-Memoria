@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/codispersion_bootstrap/__init__.py
+src/codispersion_bootstrap/bootstrap.py
+src/codispersion_bootstrap/codispersion.py
+src/codispersion_bootstrap/experiments.py
+src/codispersion_bootstrap/monte_carlo.py
+src/codispersion_bootstrap/plotting.py
+src/codispersion_bootstrap/sexto_plots.py
+src/codispersion_bootstrap/simulation.py
+src/codispersion_bootstrap/utils.py
+src/codispersion_bootstrap.egg-info/PKG-INFO
+src/codispersion_bootstrap.egg-info/SOURCES.txt
+src/codispersion_bootstrap.egg-info/dependency_links.txt
+src/codispersion_bootstrap.egg-info/requires.txt
+src/codispersion_bootstrap.egg-info/top_level.txt
+tests/test_smoke.py

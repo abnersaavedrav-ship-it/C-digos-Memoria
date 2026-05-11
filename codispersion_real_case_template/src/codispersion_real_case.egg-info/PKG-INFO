@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: codispersion-real-case
+Version: 0.1.0
+Summary: Aplicación real de codispersión y bootstrap espacial pareado para imágenes de nanotubos.
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: matplotlib
+Requires-Dist: pillow
+Requires-Dist: imageio
+Requires-Dist: seaborn
